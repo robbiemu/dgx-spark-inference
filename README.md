@@ -7,10 +7,13 @@
 > **It is not a multi-tenant serving platform or an Ollama-style request-driven
 > model loader.**
 
+
 The topology is opinionated by its constraints: one GB10, one client,
 operator-driven swaps, systemd. Multiple roles are out of scope for v0.1; the
 release ships only the **`agentic`** role (coding/general agent work), served as
 `qwen3.6-27b-agentic`. This is a reference implementation, not a generic platform.
+
+<img width="100%" alt="ChatGPT Image 30 de jun  de 2026, 14_12_19" src="https://github.com/user-attachments/assets/4de0716b-1b83-4d32-8f0e-a49b2e91950e" />
 
 ## Tested environment
 
