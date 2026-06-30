@@ -23,9 +23,21 @@ of leaving this unoptimized.
 
 ## Broader roles
 
-The architecture supports additional roles (embeddings, completion, memory)
-additively — a new role is a `roles.toml` entry + capability records + catalog
-rows. v0.1 ships `agentic` only.
+The architecture supports additional roles additively — a new role is a
+`roles.toml` entry + capability records + catalog rows. v0.1 ships `agentic` only.
+The cost depends on the role's modality:
+
+- **Text-based roles** (embeddings, completion, memory) are genuinely additive:
+  config + records + catalog, no code changes to the dispatcher or adapter.
+- **Multimodal/audio roles** carry real caveats. The runtime image would need the
+  relevant packages (e.g. `torchcodec` for audio — not in the base sglang image,
+  so a `Dockerfile` change). The reasoning/tool parsers are currently read from
+  the runtime manifest and are not per-profile overridable, so a model needing
+  different parsers would require an adapter change. And sglang's current
+  audio backends (`mimo_audio`, `mimo_v2_asr`) import FA3, which asserts SM≤90 —
+  on GB10 (SM100) those backends will not load (see
+  [`known-limitations.md`](known-limitations.md)). A non-FA3 multimodal backend
+  would be fine; the present sglang audio stack is hardware-blocked here.
 
 ## DFlash full-context (262144) fit validation and promotion
 

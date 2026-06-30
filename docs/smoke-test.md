@@ -37,9 +37,13 @@ curl -s http://127.0.0.1:$PORT/v1/models \
   -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
 
 # 5. Semantic completion: expect a correct, coherent answer.
+#    Use max_tokens>=1024: thinking-mode models spend tokens on the reasoning
+#    trace (reasoning_content) BEFORE the visible answer. A tiny budget (e.g. 64)
+#    returns content="" with finish_reason="length" — the model was still thinking,
+#    not broken. (Alternatively, set "enable_thinking":false to skip reasoning.)
 curl -s http://127.0.0.1:$PORT/v1/chat/completions \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"model":"qwen3.6-27b-agentic","max_tokens":64,"messages":[{"role":"user","content":"What is the capital of France? Answer with just the city name."}]}' \
+  -d '{"model":"qwen3.6-27b-agentic","max_tokens":1024,"messages":[{"role":"user","content":"What is the capital of France? Answer with just the city name."}]}' \
   | python3 -m json.tool
 ```
 

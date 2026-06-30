@@ -83,6 +83,39 @@ pick_optional() {  # pick_optional <cfg> <manifest> <cfg.key> <manifest.key>
   return 3
 }
 
+# resolve_model_dir <spec> <cache_root> <container_cache_root>
+# Resolves the model directory for the single-model launch path and prints the
+# CONTAINER path (under <container_cache_root>) plus the HOST path (under
+# <cache_root>) as "<container_path>|<host_path>".
+#
+# Two layouts are supported:
+#   1. Explicit override: identity.model_dir in the spec. Used VERBATIM as a path
+#      relative to the cache root. This is the form a `hf download ... --local-dir`
+#      fetch produces (a plain directory of real files). The profile README tells
+#      the operator to set this only for that layout.
+#   2. Default (no override): derive the Hugging Face cache layout from the spec's
+#      source_repository + source_revision:
+#        <cache_root>/models--<repo with '/'->'--'>/snapshots/<revision>
+#      This works against a standard `hf download` cache with zero copying.
+resolve_model_dir() {  # resolve_model_dir <spec> <cache_root> <container_cache_root>
+  local spec="$1" cache_root="${2%/}" cont_cache="${3%/}" model_dir host_rel
+  model_dir="$(toml_get "$spec" identity.model_dir 2>/dev/null || true)"
+  if [ -n "$model_dir" ]; then
+    host_rel="${model_dir#/}"
+  else
+    local repo rev
+    repo="$(toml_get "$spec" identity.source_repository)"
+    rev="$(toml_get "$spec" identity.source_revision)"
+    if [ -z "$repo" ] || [ -z "$rev" ]; then
+      echo "REFUSING: spec lacks identity.model_dir AND identity.source_repository/source_revision (cannot locate weights)" >&2
+      exit 1
+    fi
+    # HF cache encodes "org/name" as "models--org--name".
+    host_rel="models--${repo//\//--}/snapshots/${rev}"
+  fi
+  printf '%s|%s' "${cont_cache}/${host_rel}" "${cache_root}/${host_rel}"
+}
+
 [ -f "$SPEC_PATH" ] || { echo "REFUSING: spec missing: $SPEC_PATH" >&2; exit 1; }
 MANIFEST="$RUNTIME_ROOT/runtime-manifest.toml"
 IMAGE="$(toml_get "$MANIFEST" image)"
@@ -149,11 +182,17 @@ umask 077
 # ===========================================================================
 if [ "$KIND" = "model" ]; then
   # ---- SINGLE MODEL ---------------------------------------------------------
-  # Profiles describe, never contain weights. local_dir is a deterministic
-  # subdir of MODEL_CACHE_ROOT (documented in the profile README). The adapter
-  # mounts MODEL_CACHE_ROOT -> CACHE_ROOT read-only and points sglang at it.
-  LOCAL_DIR="$(toml_get "$SPEC_PATH" identity.local_dir)"
-  CONTAINER_MODEL_PATH="${CACHE_ROOT%/}/${LOCAL_DIR#/}"
+  # Profiles describe, never contain weights. resolve_model_dir locates the
+  # snapshot under MODEL_CACHE_ROOT (HF cache layout by default; identity.model_dir
+  # override for a --local-dir plain directory). We mount MODEL_CACHE_ROOT ->
+  # CACHE_ROOT read-only and point sglang at the container path.
+  IFS='|' read -r CONTAINER_MODEL_PATH HOST_MODEL_PATH <<EOF
+$(resolve_model_dir "$SPEC_PATH" "$MODEL_CACHE_ROOT" "$CACHE_ROOT")
+EOF
+  # Preflight: refuse EARLY if the weights aren't where we resolved them, so a
+  # misconfigured MODEL_CACHE_ROOT fails with a clear message instead of 30s into
+  # a sglang load.
+  [ -d "$HOST_MODEL_PATH" ] || { echo "REFUSING: model dir not found: $HOST_MODEL_PATH (check MODEL_CACHE_ROOT / identity.model_dir)" >&2; exit 1; }
   CTX="$(pick "$SPEC_PATH" "$MANIFEST" launch.context_length common_launch.context_length)"
   MR="$(pick "$SPEC_PATH" "$MANIFEST" launch.max_running_requests common_launch.max_running_requests)"
   MQ="$(pick "$SPEC_PATH" "$MANIFEST" launch.max_queued_requests common_launch.max_queued_requests)"
@@ -178,8 +217,15 @@ elif [ "$KIND" = "bundle" ]; then
   DRAFTER_CFG="$PROJECT_ROOT/profiles/experimental/qwen36-27b-${DRAFTER_ID#qwen36-27b-}/sglang.toml"
   [ -f "$TARGET_CFG" ] || { echo "REFUSING: target config missing: $TARGET_CFG" >&2; exit 1; }
   [ -f "$DRAFTER_CFG" ] || { echo "REFUSING: drafter config missing: $DRAFTER_CFG" >&2; exit 1; }
-  TARGET_LOCAL_DIR="$(toml_get "$TARGET_CFG" identity.local_dir)"
-  DRAFTER_LOCAL_DIR="$(toml_get "$DRAFTER_CFG" identity.local_dir)"
+  # Resolve target + drafter dirs the same way the single-model path does.
+  IFS='|' read -r TARGET_CONTAINER_PATH TARGET_HOST_PATH <<EOF
+$(resolve_model_dir "$TARGET_CFG" "$MODEL_CACHE_ROOT" "$CACHE_ROOT")
+EOF
+  IFS='|' read -r _ DRAFTER_HOST_PATH <<EOF
+$(resolve_model_dir "$DRAFTER_CFG" "$MODEL_CACHE_ROOT" "$CACHE_ROOT")
+EOF
+  [ -d "$TARGET_HOST_PATH" ] || { echo "REFUSING: target dir not found: $TARGET_HOST_PATH" >&2; exit 1; }
+  [ -d "$DRAFTER_HOST_PATH" ] || { echo "REFUSING: drafter dir not found: $DRAFTER_HOST_PATH" >&2; exit 1; }
   ALGO="$(toml_get "$SPEC_PATH" coordination.algorithm)"
   NUM_DRAFT="$(toml_get "$SPEC_PATH" coordination.num_draft_tokens)"
   ATTN="$(pick "$SPEC_PATH" "$MANIFEST" launch.attention_backend common_launch.attention_backend)"
@@ -192,7 +238,7 @@ elif [ "$KIND" = "bundle" ]; then
     --rm --name "$CONTAINER_NAME" --gpus all --ipc host \
     --publish "${HOST_BIND}:${PORT}:${PORT}" \
     --volume "${MODEL_CACHE_ROOT}:${CACHE_ROOT}:ro" \
-    --volume "${MODEL_CACHE_ROOT}/${DRAFTER_LOCAL_DIR#/}:/drafter:ro" \
+    --volume "${DRAFTER_HOST_PATH}:/drafter:ro" \
     --volume "${RUNTIME_CONFIG_HOST}:${RUNTIME_CONFIG_CONTAINER}:ro" \
     --entrypoint /bin/sh "$IMAGE" \
     -ceu 'exec sglang serve --model-path "$1" --config "$2" \
@@ -200,7 +246,7 @@ elif [ "$KIND" = "bundle" ]; then
         --speculative-draft-model-path /drafter \
         --speculative-num-draft-tokens "'"${NUM_DRAFT}"'" \
         --trust-remote-code --attention-backend "'"${ATTN}"'"' \
-    sh "${CACHE_ROOT%/}/${TARGET_LOCAL_DIR#/}" "$RUNTIME_CONFIG_CONTAINER"
+    sh "$TARGET_CONTAINER_PATH" "$RUNTIME_CONFIG_CONTAINER"
 
 else
   echo "REFUSING: unknown kind '$KIND' (expected model|bundle)." >&2; exit 1

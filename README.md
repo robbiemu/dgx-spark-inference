@@ -18,7 +18,7 @@ release ships only the **`agentic`** role (coding/general agent work), served as
   there is no alternate launcher.
 - **Reproducible profiles** that *describe* a model (HF repo + pinned revision +
   quantization + launch params). **No model weights are redistributed** — fetch
-  them with `huggingface-cli` (documented per profile).
+  them with `hf` (the Hugging Face CLI; documented per profile).
 - **Explicit compatibility contracts**: capability records + a resolver that
   proves a candidate satisfies a role's requirements. Production safety comes
   from capability validation in the test suite **and** the runtime catalog only
@@ -37,10 +37,11 @@ fetched (see `profiles/qwen36-27b-fp8/README.md`).
 
 ```bash
 # 1. Fetch the baseline weights into your model cache (one-time).
+#    Qwen3.6-27B-FP8 is gated: accept the license on the repo page, then `hf auth login`.
 export MODEL_CACHE_ROOT=/srv/model-cache
-huggingface-cli download Qwen/Qwen3.6-27B-FP8 \
-  --revision e89b16ebf1988b3d6befa7de50abc2d76f26eb09 \
-  --local-dir "$MODEL_CACHE_ROOT/qwen36-27b-fp8"
+export HF_HOME="$MODEL_CACHE_ROOT"
+hf download Qwen/Qwen3.6-27B-FP8 \
+  --revision e89b16ebf1988b3d6befa7de50abc2d76f26eb09
 
 # 2. Create your secret (operator-supplied; never handled by this repo).
 install -d -m 0700 ~/.config/dgx-spark-inference

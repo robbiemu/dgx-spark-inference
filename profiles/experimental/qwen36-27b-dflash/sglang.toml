@@ -14,9 +14,11 @@ source_repository = "z-lab/Qwen3.6-27B-DFlash"
 source_revision   = "0919688658996800f86b895034249700e9481106"
 quantization      = "none"            # bfloat16, no quantization (per config.json)
 precision         = "bfloat16"
-# Deterministic location of the drafter under MODEL_CACHE_ROOT. The bundle
-# adapter mounts it at /drafter read-only. Fetch once (see the bundle README).
-local_dir = "qwen36-27b-dflash-drafter"
+# Weight location resolved at launch (same rule as the baseline profile). Default
+# derives the HF cache layout from source_repository/source_revision; set
+# model_dir to a plain directory RELATIVE to MODEL_CACHE_ROOT to override. The
+# bundle adapter mounts the resolved path at /drafter read-only.
+# model_dir = "qwen36-27b-dflash-drafter-plain"
 
 [launch]
 # The drafter is loaded by sglang's DFlashWorkerV2 via --speculative-draft-model-path,

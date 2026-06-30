@@ -21,8 +21,8 @@ that scope honest are welcome.
   installer inputs surfaced via `$CONFIG_ROOT/inference.env`. The scanner will fail
   the gate if you add one.
 - **Profiles describe, never contain weights.** A profile carries HF repo + pinned
-  revision + quantization + launch params. Fetch weights with `huggingface-cli`
-  (documented per profile). No weights are redistributed.
+  revision + quantization + launch params. Fetch weights with `hf` (the Hugging
+  Face CLI; documented per profile). No weights are redistributed.
 - **One launch path.** `systemd → dispatch.sh → sglang adapter`. Don't add an
   alternate launcher.
 - **Capability honesty.** A capability record states what a model *provides*.

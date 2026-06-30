@@ -17,11 +17,13 @@ runtime_id = "sglang-v0.5.14-cu130-runtime-distro1.9.0"
 source_repository = "Qwen/Qwen3.6-27B-FP8"
 source_revision   = "e89b16ebf1988b3d6befa7de50abc2d76f26eb09"
 quantization      = "fp8"
-# Deterministic location of the snapshot under MODEL_CACHE_ROOT. The adapter
-# mounts MODEL_CACHE_ROOT -> /hf-cache read-only and points sglang at
-# /hf-cache/<local_dir>. Fetch this snapshot once (see README.md). No machine-
-# specific path is committed.
-local_dir = "qwen36-27b-fp8"
+# Weight location is resolved at launch, never committed as a host path. By
+# default the adapter derives the Hugging Face cache layout from the two fields
+# above: <MODEL_CACHE_ROOT>/models--Qwen--Qwen3.6-27B-FP8/snapshots/<revision>.
+# To override (e.g. you fetched with `hf download --local-dir <dir>`), uncomment
+# model_dir and set it to the path of the plain directory RELATIVE to
+# MODEL_CACHE_ROOT; it is used verbatim. See README.md.
+# model_dir = "qwen36-27b-fp8-plain"
 
 # Launch parameters that are this MODEL's facts (not runtime defaults).
 # The runtime default context/pool is overridden here because this deployment

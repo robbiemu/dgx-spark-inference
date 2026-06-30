@@ -57,14 +57,17 @@ machine-specific artifacts are published):
 
 ## Fetch the drafter (one-time, per host)
 
-The bundle adapter mounts the drafter from `MODEL_CACHE_ROOT` read-only. Fetch
-the pinned revision into the deterministic dir declared by the drafter profile:
+The bundle adapter mounts the drafter from `MODEL_CACHE_ROOT` read-only. The
+drafter resolves the same way the baseline does: by default from the Hugging Face
+cache layout derived from its `source_repository` + `source_revision` (set
+`model_dir` in the drafter's `sglang.toml` for a `--local-dir` plain directory).
+Fetch via the cache:
 
 ```bash
 export MODEL_CACHE_ROOT=/srv/model-cache
-huggingface-cli download z-lab/Qwen3.6-27B-DFlash \
-  --revision 0919688658996800f86b895034249700e9481106 \
-  --local-dir "$MODEL_CACHE_ROOT/qwen36-27b-dflash-drafter"
+export HF_HOME="$MODEL_CACHE_ROOT"
+hf download z-lab/Qwen3.6-27B-DFlash \
+  --revision 0919688658996800f86b895034249700e9481106
 ```
 
 The target weights are the baseline profile (`profiles/qwen36-27b-fp8/`).
