@@ -1,0 +1,33 @@
+# configs/sglang.toml — model qwen36-27b-dflash (DFlash DRAFTER): its parameters
+# and non-standard launch overrides under the sglang runtime.
+#
+# This is the drafter COMPONENT of a DFlash bundle, not a standalone served model.
+# It is EXPERIMENTAL: not a production candidate for any role (the DFlash bundle
+# lacks grammar-constrained structured_output). See
+# bundles/experimental/qwen36-27b-fp8-dflash/. See docs/architecture.md.
+kind = "model-runtime-config"
+model_id   = "qwen36-27b-dflash"
+runtime_id = "sglang-v0.5.14-cu130-runtime-distro1.9.0"
+
+[identity]
+source_repository = "z-lab/Qwen3.6-27B-DFlash"
+source_revision   = "0919688658996800f86b895034249700e9481106"
+quantization      = "none"            # bfloat16, no quantization (per config.json)
+precision         = "bfloat16"
+# Deterministic location of the drafter under MODEL_CACHE_ROOT. The bundle
+# adapter mounts it at /drafter read-only. Fetch once (see the bundle README).
+local_dir = "qwen36-27b-dflash-drafter"
+
+[launch]
+# The drafter is loaded by sglang's DFlashWorkerV2 via --speculative-draft-model-path,
+# NOT as a primary --model-path. Its own launch params are minimal; the bundle
+# adapter mounts it at /drafter and passes --trust-remote-code (drafter auto_map).
+needs_trust_remote_code = true
+attention_backend       = "flashinfer"   # DFlash requires flashinfer on GB10 (SM100)
+
+[architecture]
+architectures       = ["DFlashDraftModel"]
+num_hidden_layers   = 5
+sliding_window      = 2048
+max_window_layers   = 5              # all 5 layers are SWA
+note                = "SGLang registers DFlashDraftModel internally; the missing dflash.py in-repo does not block load (verified gate 2)."

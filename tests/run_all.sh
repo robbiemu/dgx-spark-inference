@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# run_all.sh — the v0.1 no-GPU test gate.
+# Runs the five load-bearing tests + TOML schema validation + the contextual
+# secret scan over the whole repo. No GPU, no docker, no network, no package
+# install (python3 3.12 stdlib only). Exits nonzero on any failure.
+#
+# ShellCheck and the external secret scanners (gitleaks, trufflehog) are run
+# separately by the owner after tool install — they are NOT part of this gate.
+set -u
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT" || exit 1
+
+fail=0
+say() { printf '\n\033[1m=== %s ===\033[0m\n' "$*"; }
+
+say "TOML schema validation (parse every .toml)"
+python3 - "$ROOT" <<'PY' || fail=1
+import sys, tomllib
+from pathlib import Path
+root = Path(sys.argv[1])
+tomls = sorted(p for p in root.rglob("*.toml") if ".git" not in p.parts)
+assert tomls, "no toml files found"
+bad = []
+for p in tomls:
+    try:
+        tomllib.loads(p.read_text())
+    except Exception as e:
+        bad.append(f"{p.relative_to(root)}: {e}")
+if bad:
+    print("TOML parse failures:", file=sys.stderr)
+    for b in bad: print("  " + b, file=sys.stderr)
+    sys.exit(1)
+print(f"OK: {len(tomls)} TOML files parse")
+PY
+
+say "Test 1 — baseline satisfies agentic"
+python3 tests/test_baseline_satisfies_agentic.py || fail=1
+
+say "Test 2 — DFlash rejected for agentic"
+python3 tests/test_dflash_rejected_for_agentic.py || fail=1
+
+say "Test 3 — available catalog compatibility"
+python3 tests/test_available_catalog_compatible.py || fail=1
+
+say "Test 4 — launch-config rendering (real adapter)"
+python3 tests/test_launch_config_rendering.py || fail=1
+
+say "Test 5 — dry-run has no secrets"
+python3 tests/test_dry_run_no_secrets.py || fail=1
+
+say "Test 6 — experimental isolation (adapter honors caller port, not prod)"
+python3 tests/test_experimental_isolation.py || fail=1
+
+say "Repository-wide contextual secret scan"
+python3 tests/scan_secrets.py "$ROOT" || fail=1
+
+echo
+if [ "$fail" = 0 ]; then
+  echo "ALL TESTS PASSED"
+  exit 0
+else
+  echo "ONE OR MORE TESTS FAILED" >&2
+  exit 1
+fi

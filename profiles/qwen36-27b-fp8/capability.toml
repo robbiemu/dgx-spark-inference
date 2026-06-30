@@ -1,0 +1,34 @@
+# model capability record — qwen36-27b-fp8.
+# Resolver input (tools/resolve_service_plan.py); NOT on the live launch path.
+# This record is what makes the baseline a valid production candidate for the
+# agentic role: it CLAIMS grammar-constrained structured_output. See
+# docs/architecture.md. Schema: config/schemas/capability-records.md.
+kind = "model-capability"
+capability_id = "qwen3.6-27b-agentic-baseline"
+promotion_state = "approved"
+approval_scope = "public-reference-v0.1"
+
+model_id = "qwen36-27b-fp8"
+source_repository = "Qwen/Qwen3.6-27B-FP8"
+source_revision = "e89b16ebf1988b3d6befa7de50abc2d76f26eb09"
+quantization = "fp8"
+
+roles = ["agentic"]
+
+# These are the capabilities the role vocabulary can require. The agentic role
+# requires structured_output (grammar-constrained). This model provides it, so the
+# resolver resolves it for agentic (test 1). Contrast with the DFlash bundle,
+# which omits structured_output and is therefore rejected (test 2).
+capabilities = [
+  "chat_completion",
+  "reasoning",
+  "structured_output",
+  "tool_calling",
+  "multiturn_continuity",
+]
+
+compatible_runtime_ids = [
+  "sglang-v0.5.14-cu130-runtime-distro1.9.0",
+]
+
+launch_profile = "qwen36-fp8-agentic-baseline"

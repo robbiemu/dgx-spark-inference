@@ -1,0 +1,28 @@
+# runtime capability record — the sglang runtime's capability statement.
+# Resolver input (tools/resolve_service_plan.py). This is NOT on the live launch
+# path; the dispatcher never invokes the resolver. See docs/architecture.md.
+#
+# A capability record whose promotion_state != "approved" is ignored by the
+# resolver. See config/schemas/capability-records.md.
+kind = "runtime-capability"
+runtime_id = "sglang-v0.5.14-cu130-runtime-distro1.9.0"
+promotion_state = "approved"
+approval_scope = "public-reference-v0.1"
+
+runtime = "sglang"
+runtime_version = "0.5.14"
+derived_image = "local/sglang-runtime:v0.5.14-cu130-runtime-distro1.9.0"
+# NOTE: the pinned image ID lives in ONE place — runtime-manifest.toml (image_id).
+# It is intentionally NOT duplicated here, so a fresh build (scripts/build-runtime.sh
+# --update) cannot leave a stale pin in the capability record. The resolver does not
+# read this field; it is descriptive only.
+container_cache_root = "/hf-cache"
+
+approved_profiles = ["qwen36-fp8-agentic-baseline"]
+
+[launch_requirements]
+device = "cuda"
+context_length = 262144
+reasoning_parser = "qwen3"
+tool_call_parser = "qwen3_coder"
+speculation = "disabled"

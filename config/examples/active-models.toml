@@ -1,0 +1,8 @@
+# active-models.toml — what is resident RIGHT NOW, per role.
+# OPERATOR state under CONFIG_ROOT (default /etc/dgx-spark-inference). Seeded from
+# this example by install.sh on first install; operator-owned thereafter. The ONLY
+# file a swap edits (inference-cli use <role> <candidate>). The runtime catalog
+# (available.toml) is never touched by swaps. See docs/architecture.md.
+[active.agentic]
+model_id   = "qwen36-27b-fp8"                   # must be in available.toml[agentic].models[].id
+runtime_id = "sglang-v0.5.14-cu130-runtime-distro1.9.0"

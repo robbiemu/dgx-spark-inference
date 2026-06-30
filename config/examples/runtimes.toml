@@ -1,0 +1,11 @@
+# runtimes.toml — registry of approved runtime projects.
+# OPERATOR state under CONFIG_ROOT (default /etc/dgx-spark-inference). Seeded from
+# this example by install.sh on first install; operator-owned thereafter
+# (install.sh --replace never overwrites it). The dispatcher reads this to find a
+# runtime's project_root. Add a row when a new runtime project is approved; do
+# NOT edit the dispatcher. See docs/architecture.md.
+#
+# NOTE: project_root points at the INSTALLED runtime tree (under INSTALL_ROOT),
+# not a Git checkout. The live service must not depend on a mutable checkout.
+[runtimes.sglang-v0.5.14-cu130-runtime-distro1.9.0]
+project_root = "/usr/local/lib/dgx-spark-inference/runtime/sglang"

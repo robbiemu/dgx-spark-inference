@@ -1,0 +1,46 @@
+# configs/sglang.toml — model qwen36-27b-fp8: its parameters and NON-STANDARD
+# launch overrides under the sglang runtime.
+#
+# Role: this file does NOT decide whether the model serves a role (that is the
+# runtime's available.toml). It does NOT re-state runtime-common defaults that
+# this model inherits unchanged (parsers, log-level, host/port, entrypoint —
+# those live in runtime/sglang/runtime-manifest.toml). It states ONLY:
+#   - this model's identity/provenance (HF repo, pinned revision, quantization)
+#   - a deterministic local_dir under MODEL_CACHE_ROOT where the adapter finds it
+#   - where this model deviates from the runtime default
+# See docs/architecture.md.
+kind = "model-runtime-config"
+model_id   = "qwen36-27b-fp8"
+runtime_id = "sglang-v0.5.14-cu130-runtime-distro1.9.0"
+
+[identity]
+source_repository = "Qwen/Qwen3.6-27B-FP8"
+source_revision   = "e89b16ebf1988b3d6befa7de50abc2d76f26eb09"
+quantization      = "fp8"
+# Deterministic location of the snapshot under MODEL_CACHE_ROOT. The adapter
+# mounts MODEL_CACHE_ROOT -> /hf-cache read-only and points sglang at
+# /hf-cache/<local_dir>. Fetch this snapshot once (see README.md). No machine-
+# specific path is committed.
+local_dir = "qwen36-27b-fp8"
+
+# Launch parameters that are this MODEL's facts (not runtime defaults).
+# The runtime default context/pool is overridden here because this deployment
+# runs 262144 context with a 1/1 single-session pool.
+[launch]
+context_length       = 262144
+max_running_requests = 1
+max_queued_requests  = 1
+attention_backend    = "auto"   # = no override; sglang auto-selects on GB10
+mem_fraction_static  = 0.60    # MEASURED value for this exact config (ctx=262144,
+                               # 1/1 pool). Not KV-only: this is the static allocation
+                               # TARGET; the realized KV pool is also constrained by
+                               # weights, hybrid-attention state, CUDA graphs,
+                               # activation workspace, and DGX Spark memory accounting.
+                               # 0.60 -> 346,485-token pool (~32% margin). Renders as
+                               # mem-fraction-static in the runtime YAML. See
+                               # README.md / known-limitations.md for the calibration
+                               # and the measured non-linear fraction->pool yield.
+                               # Do not generalize to other models/hardware.
+
+# NOTE: reasoning_parser/tool_call_parser/log_level/host_port are NOT here —
+# they equal the runtime manifest defaults, so the model inherits them.

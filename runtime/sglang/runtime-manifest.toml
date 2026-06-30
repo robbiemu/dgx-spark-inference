@@ -1,0 +1,49 @@
+# runtime-manifest: what the sglang runtime IS (mechanism, not pairings).
+# See docs/architecture.md (the binding system).
+kind = "runtime-manifest"
+runtime_id   = "sglang-v0.5.14-cu130-runtime-distro1.9.0"
+runtime_kind = "sglang"                 # selects the adapter: adapters/sglang.sh
+promotion_state = "approved"
+approval_scope = "public-reference-v0.1"
+
+image        = "local/sglang-runtime:v0.5.14-cu130-runtime-distro1.9.0"
+image_id     = "sha256:d49152ee427751c40859493ca8e34083b6722e0f5579b950508a3201f1ec32cf"
+base_image   = "lmsysorg/sglang:v0.5.14-cu130-runtime"
+base_image_digest = "sha256:9e436f44523e9f53519c6175fefd1e0d373322bf54b8154bb331a2f5e4840ad2"
+
+launch_adapter = "adapters/sglang.sh"
+supported_config_kinds = ["model-runtime-config", "bundle-runtime-config"]
+
+# Vocabulary this runtime exposes to served units (what a unit's [launch] may set).
+# A unit config may override these; the manifest carries the common defaults.
+[common_launch]
+host_bind         = "0.0.0.0"
+host_port         = 30000
+container_cache_root = "/hf-cache"
+entrypoint_shape  = "sglang serve --model-path <path> --config <yaml>"
+reasoning_parser  = "qwen3"
+tool_call_parser  = "qwen3_coder"
+log_level         = "warning"
+log_level_http    = "warning"
+# Default launch facts a model may override in its configs/sglang.toml.
+# These are the runtime's standard baseline; a model states a value here only
+# if it needs something different (see profiles/qwen36-27b-fp8/sglang.toml).
+context_length       = 32768
+max_running_requests = 1
+max_queued_requests  = 1
+attention_backend    = "auto"
+# mem_fraction_static is recognized vocabulary a model may pin in its
+# profiles/<id>/sglang.toml [launch] to make the static allocation target explicit
+# (the realized KV pool is derived). It has NO default here: when a model does not
+# state it, the adapter OMITS the key and sglang computes the fraction itself
+# (unchanged behavior). See adapters/sglang.sh::emit_yaml.
+
+# Speculation algorithms this runtime supports (the mechanism; which pair uses
+# which algorithm is decided by a bundle config, not here).
+[speculation]
+supported_algorithms = ["DFLASH", "EAGLE", "EAGLE3", "NEXTN", "NGRAM"]
+notes = "DFLASH requires attention-backend=flashinfer on GB10 (SM100); fa3 asserts SM<=90."
+
+[known_limitations]
+grammar_constrained_under_dflash = "DFLASH returns HTTP 400 for response_format/grammar (gate 5a)"
+logprobs_under_dflash = "DFLASH returns HTTP 400 for return_logprob (gate 7A used /generate)"

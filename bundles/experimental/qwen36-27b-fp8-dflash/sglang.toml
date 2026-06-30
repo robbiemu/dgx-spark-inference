@@ -1,0 +1,28 @@
+# configs/sglang.toml — bundle qwen36-27b-fp8-dflash: DFlash coordination config.
+# EXPERIMENTAL. Owns ONLY the cross-model coordination. Components (target,
+# drafter) keep their own facts in their respective profile dirs.
+# See docs/architecture.md.
+kind = "bundle-runtime-config"
+bundle_id  = "qwen36-27b-fp8-dflash"
+runtime_id = "sglang-v0.5.14-cu130-runtime-distro1.9.0"
+
+[components.target]
+model_id = "qwen36-27b-fp8"           # -> profiles/qwen36-27b-fp8/sglang.toml
+
+[components.drafter]
+model_id = "qwen36-27b-dflash"        # -> profiles/experimental/qwen36-27b-dflash/sglang.toml
+role     = "drafter"
+
+[coordination]                        # cross-model knobs only
+algorithm        = "DFLASH"
+num_draft_tokens = 16                 # drafter native block_size (verified gate 2)
+
+[launch]                              # bundle-level launch (role-wide overrides)
+context_length       = 32768          # validated short-context default; 262144 fit UNVALIDATED
+max_running_requests = 1
+max_queued_requests  = 1
+attention_backend    = "flashinfer"   # DFlash REQUIRES flashinfer on GB10 (fa3 asserts SM<=90)
+
+[known_limitations]                   # from the DFlash experiment (gate 5a, 7A)
+grammar_constrained_structured_output = "unsupported (HTTP 400); prompt-only JSON works"
+logprobs                              = "unsupported under DFLASH (return_logprob HTTP 400)"

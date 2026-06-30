@@ -1,0 +1,23 @@
+# available.toml — what the sglang runtime can serve, per role.
+# See docs/architecture.md (the binding system).
+#
+# This is the runtime's CATALOG of candidate models per role + the default/home
+# + the role-slot served name. Stable; changes only when a model is approved or
+# retired. A swap edits operator state (active-models.toml), never this file.
+#
+# IMPORTANT (capability contract): every candidate offered here MUST satisfy its
+# role's required capabilities. The dispatcher does NOT call the resolver at
+# launch time; production safety comes from (1) capability validation in the repo
+# test suite (test_available_catalog_compatible) and (2) this catalog only ever
+# listing capability-compatible candidates. Do NOT add a candidate that fails the
+# resolver for its role. DFlash is intentionally absent from [agentic] because it
+# lacks grammar-constrained structured_output — see bundles/experimental/.
+
+[roles.agentic]
+default           = "qwen36-27b-fp8"            # home model (boot + reload-to-home)
+served_model_name = "qwen3.6-27b-agentic"       # role-slot wire name; stable across swaps
+
+  [[roles.agentic.models]]
+  id   = "qwen36-27b-fp8"                        # the approved plain FP8 baseline
+  kind = "model"                                 # must match the spec's kind (model-runtime-config)
+  spec = "profiles/qwen36-27b-fp8/sglang.toml"   # resolved relative to PROJECT_ROOT

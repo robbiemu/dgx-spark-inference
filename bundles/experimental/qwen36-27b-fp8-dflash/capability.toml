@@ -1,0 +1,58 @@
+# model capability record — qwen36-27b-fp8-dflash (DFlash bundle). EXPERIMENTAL.
+# Resolver input (tools/resolve_service_plan.py); NOT on the live launch path.
+#
+# THIS is the record test 2 turns on. DFlash simply LACKS grammar-constrained
+# structured_output: note it is absent from the capabilities list below. There is
+# deliberately NO "structured_output_prompt_only" identifier — the role vocabulary
+# is "things a role can require," and DFlash just doesn't provide the one the
+# agentic role requires. So the resolver rejects DFlash for agentic.
+# Schema: config/schemas/capability-records.md.
+kind = "model-capability"
+capability_id = "qwen36-27b-fp8-dflash-agentic"
+promotion_state = "approved"           # approved = eligible for resolver consideration
+approval_scope = "experimental-dflash-2026-06-29"
+
+model_id = "qwen36-27b-fp8-dflash"     # the bundle id
+kind_detail = "bundle"                 # single model vs coordinated bundle
+acceleration_method = "DFLASH"
+
+# Component identities (authoritative facts live in each component profile).
+[target]
+model_id = "qwen36-27b-fp8"
+source_repository = "Qwen/Qwen3.6-27B-FP8"
+source_revision = "e89b16ebf1988b3d6befa7de50abc2d76f26eb09"
+quantization = "fp8"
+
+[drafter]
+model_id = "qwen36-27b-dflash"
+source_repository = "z-lab/Qwen3.6-27B-DFlash"
+source_revision = "0919688658996800f86b895034249700e9481106"
+precision = "bfloat16"
+
+# DFlash is NOT a production candidate for the agentic role. It is listed for the
+# resolver only so that its incompatibility is provable, not merely asserted.
+roles = ["agentic"]
+
+# NOTE: structured_output is INTENTIONALLY ABSENT. DFlash cannot do
+# grammar-constrained structured output (gate 5a returned HTTP 400). It can
+# produce prompt-only JSON, but the role vocabulary treats structured_output as
+# grammar-constrained, so DFlash does not claim it. This absence is what the
+# resolver uses to reject DFlash for agentic.
+capabilities = [
+  "chat_completion",
+  "reasoning",
+  "tool_calling",
+  "multiturn_continuity",
+]
+
+compatible_runtime_ids = [
+  "sglang-v0.5.14-cu130-runtime-distro1.9.0",
+]
+
+launch_profile = "qwen36-fp8-dflash-agentic"
+
+[known_limitations]
+grammar_constrained_structured_output = "unsupported under DFLASH"
+logprobs                              = "unsupported under DFLASH"
+context_262144_memory_fit             = "UNVALIDATED — requires the load experiment before live binding"
+reasoning_depth_divergence            = "DFlash reasoned ~4.6x more than baseline for same seeded prompt (gate 8); both correct"

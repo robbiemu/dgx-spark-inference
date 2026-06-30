@@ -1,0 +1,22 @@
+# roles.toml — role policy: what a role requires + residency/swap policy.
+# This is the role vocabulary: the set of capabilities a role can require. A
+# candidate must provide ALL required capabilities to be resolvable for a role
+# (see tools/resolve_service_plan.py). For v0.1 only the `agentic` role ships.
+# See docs/architecture.md and config/schemas/capability-records.md.
+requested_roles = ["agentic"]
+
+[roles.agentic]
+required_model_capabilities = [
+  "chat_completion",
+  "tool_calling",
+  "structured_output",   # grammar-constrained. DFlash lacks this -> rejected.
+]
+
+# Residency & swap policy for this role. See docs/architecture.md.
+# The served model name for this role is a role-slot property (stable across
+# candidate swaps); it lives in the runtime catalog as served_model_name.
+[roles.agentic.residency]
+default_up        = true        # role's active candidate loads at service start
+idle_timeout_sec  = 900         # adaptive idle timer start: 15 min
+idle_floor_sec    = 300         # never adapts below 5 min
+idle_behavior     = "stay_up"   # "stay_up" (home; no auto-evict) | "unload"

@@ -1,0 +1,26 @@
+[Unit]
+Description=DGX Spark single-slot SGLang inference service (config-driven dispatch)
+Wants=network-online.target
+After=network-online.target docker.service
+Requires=docker.service
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+EnvironmentFile=__CONFIG_ROOT__/agent.env
+Environment=CONFIG_ROOT=__CONFIG_ROOT__
+# Config-driven launch: dispatch.sh reads active-models.toml + runtimes.toml,
+# resolves the runtime's adapter, and execs it. The adapter carries the image-id
+# pin and api-key validation. See docs/architecture.md.
+ExecStartPre=-/usr/bin/docker rm --force __CONTAINER_NAME__
+ExecStart=__INSTALL_ROOT__/dispatch.sh __ROLE__
+ExecStop=/usr/bin/docker stop --timeout 45 __CONTAINER_NAME__
+ExecStopPost=/usr/bin/rm -f /run/__CONTAINER_NAME__/sglang.yaml
+Restart=always
+RestartSec=15
+TimeoutStartSec=infinity
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
