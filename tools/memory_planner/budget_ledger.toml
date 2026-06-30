@@ -1,0 +1,50 @@
+# Budget ledger — measured Phase 0 values (the measured-memory discipline).
+# These are MEASURED, not estimated. Re-measure if dtype/attention/sglang version
+# changes. See docs/v0_2_phase0_results.md "Budget ledger".
+#
+# Uses [[profiles]] array-of-tables so model_id dots (e.g. ornith-1.0-9b-fp8)
+# are a plain string field, not a TOML table path.
+# Units: GiB for *_gib; bytes for kv_bytes_per_token; tokens for target_kv_tokens.
+
+[[profiles]]
+model_id = "qwen36-27b-fp8"
+# Primary. Steady-state nvidia-smi ~69.8 GiB; static budget f*A = 0.60*121.7 = ~73 GiB.
+# The MEASURED 0.60 INCLUDES allocator overhead (CUDA-graph capture, hybrid-attn
+# state) reserved INTO the static budget — so weights(30)+kv(~21) alone derive
+# only ~0.42. static_overhead_gib is the measured gap (~21 GiB) that makes the
+# derived fraction reproduce the empirically-tuned 0.60. MEASURED, not computed.
+[profiles.budget]
+weights_gib            = 30.0
+target_kv_tokens       = 346485
+minimum_admissible_pool_tokens = 262144   # role contract floor (full context); refuse if realized < this
+kv_bytes_per_token     = 65536.0     # 64.0 KiB/token (measured PRE_PREP)
+static_pad_gib         = 0.5
+static_overhead_gib    = 21.4        # measured gap: f*121.7 - (weights+kv+pad) (large-model)
+cuda_graph_peak_gib    = 2.0         # transient peak beyond static (cap-bs=1 would reclaim)
+request_workspace_gib  = 2.0
+gpu_headroom_gib       = 1.0
+
+[[profiles]]
+model_id = "ornith-1.0-9b-fp8"
+# Helper (recommended). Measured cold-load mem usage=12.98; realized pool 376048.
+[profiles.budget]
+weights_gib            = 12.98
+target_kv_tokens       = 376048
+minimum_admissible_pool_tokens = 32768   # helper role floor (its context); refuse if realized < this
+kv_bytes_per_token     = 65536.0     # ~64 KiB/token (same family; VERIFY in Phase 1)
+static_pad_gib         = 0.5
+cuda_graph_peak_gib    = 1.05        # measured (probe_fp8_1.log)
+request_workspace_gib  = 1.0
+gpu_headroom_gib       = 1.0
+
+[[profiles]]
+model_id = "ornith-1.0-9b-bf16"
+# Helper (fallback). Measured mem usage=17.17; realized pool 268319.
+[profiles.budget]
+weights_gib            = 17.17
+target_kv_tokens       = 268319
+kv_bytes_per_token     = 65536.0
+static_pad_gib         = 0.5
+cuda_graph_peak_gib    = 1.26        # measured (probe4.log)
+request_workspace_gib  = 1.0
+gpu_headroom_gib       = 1.0
