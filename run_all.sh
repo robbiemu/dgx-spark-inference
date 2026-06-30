@@ -51,6 +51,9 @@ python3 tests/test_dry_run_no_secrets.py || fail=1
 say "Test 6 — experimental isolation (adapter honors caller port, not prod)"
 python3 tests/test_experimental_isolation.py || fail=1
 
+say "Test 7 — memory env-var override tier (DGX_MEM_FRACTION_STATIC / DGX_MAX_TOTAL_TOKENS)"
+python3 tests/test_memory_env_override.py || fail=1
+
 say "Repository-wide contextual secret scan"
 python3 tests/scan_secrets.py "$ROOT" || fail=1
 

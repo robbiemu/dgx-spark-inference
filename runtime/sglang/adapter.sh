@@ -125,9 +125,10 @@ CACHE_ROOT="$(toml_get "$MANIFEST" common_launch.container_cache_root)"
 
 # ---- emit_yaml: the ONE render path (used live AND by the --emit-yaml probe) -
 # Writes (or prints, see mode) the runtime YAML from merged values.
-#   emit_yaml <mode: write|print> <ctx> <mr> <mq> <mfs> <api_key_or_placeholder>
+#   emit_yaml <mode: write|print> <ctx> <mr> <mq> <mfs> <mtt> <api_key_or_placeholder>
+# mfs = mem_fraction_static; mtt = max_total_tokens (both optional, "" = omit key).
 emit_yaml() {
-  local mode="$1" ctx="$2" mr="$3" mq="$4" mfs="$5" key="$6" out
+  local mode="$1" ctx="$2" mr="$3" mq="$4" mfs="$5" mtt="$6" key="$7" out
   out=$({
     printf 'served-model-name: "%s"\n' "$SERVED_NAME"
     printf 'host: "%s"\n' "$HOST_BIND"
@@ -137,7 +138,13 @@ emit_yaml() {
     printf 'max-queued-requests: %s\n' "$mq"
     # Optional: only emitted when the unit pinned mem_fraction_static (otherwise
     # the key is absent and sglang computes the fraction = unchanged behavior).
+    # The env-var override (DGX_MEM_FRACTION_STATIC) takes precedence — set by
+    # dispatch.sh's memory preflight when present; falls back to the spec value.
     [ -n "$mfs" ] && printf 'mem-fraction-static: %s\n' "$mfs"
+    # Optional: max_total_tokens caps the realized KV pool (the order-safety knob).
+    # Only emitted when set (via DGX_MAX_TOTAL_TOKENS from the preflight, or future
+    # spec field). Empty = omit key = sglang's uncapped default behavior preserved.
+    [ -n "$mtt" ] && printf 'max-total-tokens: %s\n' "$mtt"
     printf 'reasoning-parser: "%s"\n' "$(toml_get "$MANIFEST" common_launch.reasoning_parser)"
     printf 'tool-call-parser: "%s"\n' "$(toml_get "$MANIFEST" common_launch.tool_call_parser)"
     printf 'log-level: "%s"\n' "$(toml_get "$MANIFEST" common_launch.log_level)"
@@ -163,8 +170,9 @@ if [ "${8:-}" = "emit-yaml" ]; then
   CTX="$(pick "$SPEC_PATH" "$MANIFEST" launch.context_length common_launch.context_length)"
   MR="$(pick "$SPEC_PATH" "$MANIFEST" launch.max_running_requests common_launch.max_running_requests)"
   MQ="$(pick "$SPEC_PATH" "$MANIFEST" launch.max_queued_requests common_launch.max_queued_requests)"
-  MFS="$(pick_optional "$SPEC_PATH" "$MANIFEST" launch.mem_fraction_static common_launch.mem_fraction_static || true)"
-  emit_yaml print "$CTX" "$MR" "$MQ" "$MFS" "REDACTED-PLACEHOLDER"
+  MFS="${DGX_MEM_FRACTION_STATIC:-$(pick_optional "$SPEC_PATH" "$MANIFEST" launch.mem_fraction_static common_launch.mem_fraction_static || true)}"
+  MTT="${DGX_MAX_TOTAL_TOKENS:-}"
+  emit_yaml print "$CTX" "$MR" "$MQ" "$MFS" "$MTT" "REDACTED-PLACEHOLDER"
   exit 0
 fi
 
@@ -196,8 +204,9 @@ EOF
   CTX="$(pick "$SPEC_PATH" "$MANIFEST" launch.context_length common_launch.context_length)"
   MR="$(pick "$SPEC_PATH" "$MANIFEST" launch.max_running_requests common_launch.max_running_requests)"
   MQ="$(pick "$SPEC_PATH" "$MANIFEST" launch.max_queued_requests common_launch.max_queued_requests)"
-  MFS="$(pick_optional "$SPEC_PATH" "$MANIFEST" launch.mem_fraction_static common_launch.mem_fraction_static || true)"
-  emit_yaml write "$CTX" "$MR" "$MQ" "$MFS" "$SGLANG_API_KEY"
+  MFS="${DGX_MEM_FRACTION_STATIC:-$(pick_optional "$SPEC_PATH" "$MANIFEST" launch.mem_fraction_static common_launch.mem_fraction_static || true)}"
+  MTT="${DGX_MAX_TOTAL_TOKENS:-}"
+  emit_yaml write "$CTX" "$MR" "$MQ" "$MFS" "$MTT" "$SGLANG_API_KEY"
   exec /usr/bin/docker run \
     --rm --name "$CONTAINER_NAME" --gpus all --ipc host \
     --publish "${HOST_BIND}:${PORT}:${PORT}" \
@@ -232,8 +241,9 @@ EOF
   CTX="$(pick "$SPEC_PATH" "$MANIFEST" launch.context_length common_launch.context_length)"
   MR="$(pick "$SPEC_PATH" "$MANIFEST" launch.max_running_requests common_launch.max_running_requests)"
   MQ="$(pick "$SPEC_PATH" "$MANIFEST" launch.max_queued_requests common_launch.max_queued_requests)"
-  MFS="$(pick_optional "$SPEC_PATH" "$MANIFEST" launch.mem_fraction_static common_launch.mem_fraction_static || true)"
-  emit_yaml write "$CTX" "$MR" "$MQ" "$MFS" "$SGLANG_API_KEY"
+  MFS="${DGX_MEM_FRACTION_STATIC:-$(pick_optional "$SPEC_PATH" "$MANIFEST" launch.mem_fraction_static common_launch.mem_fraction_static || true)}"
+  MTT="${DGX_MAX_TOTAL_TOKENS:-}"
+  emit_yaml write "$CTX" "$MR" "$MQ" "$MFS" "$MTT" "$SGLANG_API_KEY"
   exec /usr/bin/docker run \
     --rm --name "$CONTAINER_NAME" --gpus all --ipc host \
     --publish "${HOST_BIND}:${PORT}:${PORT}" \
