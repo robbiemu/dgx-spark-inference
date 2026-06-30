@@ -6,7 +6,7 @@ that scope honest are welcome.
 
 ## Before you change anything
 
-1. **Run the gate.** `bash tests/run_all.sh` must pass (TOML validation, the five
+1. **Run the gate.** `bash tests/run_all.sh` must pass (TOML validation, the six
    no-GPU tests, and the contextual secret scan). It needs only python3 (3.12+).
 2. **Read [`docs/architecture.md`](docs/architecture.md)**, especially the
    "Capability enforcement" section: the resolver is a consistency tool, **not** a

@@ -4,14 +4,19 @@ Operating the service after install. See [`architecture.md`](architecture.md) fo
 how a request gets served and [`security.md`](security.md) for the firewall
 prerequisite.
 
+The operator CLI is installed at:
+`/usr/local/lib/dgx-spark-inference/src/inferencectl/inference-cli.sh`
+(under `INSTALL_ROOT`; not the source checkout — the live service must not
+depend on a mutable checkout). The examples below set it as `INFCTL`. The CLI
+accepts `--config-root` or the `CONFIG_ROOT` env var (default
+`/etc/dgx-spark-inference`).
+
 ## Status / inspection (read-only)
 
 ```bash
-CONFIG_ROOT=/etc/dgx-spark-inference \
-  src/inferencectl/inference-cli.sh status
-
-CONFIG_ROOT=/etc/dgx-spark-inference \
-  src/inferencectl/inference-cli.sh candidates agentic
+INFCTL=/usr/local/lib/dgx-spark-inference/src/inferencectl/inference-cli.sh
+sudo CONFIG_ROOT=/etc/dgx-spark-inference "$INFCTL" status
+sudo CONFIG_ROOT=/etc/dgx-spark-inference "$INFCTL" candidates agentic
 ```
 
 `status` prints the resident model per role, the systemd state, the health code,
@@ -21,8 +26,7 @@ role and marks the active one.
 ## Swap the resident model (cold load, ~4 min for 27B)
 
 ```bash
-CONFIG_ROOT=/etc/dgx-spark-inference \
-  src/inferencectl/inference-cli.sh use agentic <candidate_id>
+sudo CONFIG_ROOT=/etc/dgx-spark-inference "$INFCTL" use agentic <candidate_id>
 ```
 
 `use` validates the candidate is offered, backs up `active-models.toml`, edits it,

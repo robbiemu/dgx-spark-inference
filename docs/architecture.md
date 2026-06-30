@@ -92,8 +92,8 @@ model changes.
 ## Configuration discovery (single mechanism)
 
 Machine-specific values are not committed anywhere. systemd sets `CONFIG_ROOT`
-(unit `Environment=`); `inference-cli` accepts `--config-root`; the generic
-fallback is `/etc/dgx-spark-inference`. Scripts source
+(unit `Environment=`); `inference-cli` accepts either the `--config-root` flag or
+the `CONFIG_ROOT` env var (default `/etc/dgx-spark-inference`). Scripts source
 `$CONFIG_ROOT/inference.env` (written by the installer) for the seven resolved
 values (`INSTALL_ROOT`, `PROJECT_ROOT`, `MODEL_CACHE_ROOT`, `ROLE`, `PORT`,
 `CONTAINER_NAME`, …). `PROJECT_ROOT` defaults to `INSTALL_ROOT` — the live service

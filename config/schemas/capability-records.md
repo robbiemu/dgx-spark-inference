@@ -44,10 +44,15 @@ Lives beside its runtime (e.g. `runtime/sglang/capability.toml`). Required field
 - `runtime_id`
 - `promotion_state`
 - `runtime`, `runtime_version`
-- `derived_image`, `derived_image_id`
+- `derived_image`
 - `container_cache_root`
 - `approved_profiles`
 - `[launch_requirements]` — device, context_length, parsers, speculation
+
+The pinned image **ID** lives in exactly one place — `runtime-manifest.toml`
+(`image_id`) — so a fresh build (`scripts/build-runtime.sh --update`) cannot leave
+a stale pin in the capability record. Do **not** add `derived_image_id` here; the
+resolver does not read it, and duplicating the pin creates two sources of truth.
 
 ## The capability records in this repo
 

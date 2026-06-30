@@ -12,6 +12,22 @@ operator-driven swaps, systemd. Multiple roles are out of scope for v0.1; the
 release ships only the **`agentic`** role (coding/general agent work), served as
 `qwen3.6-27b-agentic`. This is a reference implementation, not a generic platform.
 
+## Tested environment
+
+The measurements and behavior in this repo were validated on this configuration
+(record the date you reproduce on your own):
+
+| Component | Value |
+|---|---|
+| Hardware | NVIDIA DGX Spark (NVIDIA GB10, 121 GiB unified memory) |
+| OS / kernel | Ubuntu 24.04.4 LTS · kernel `6.17.0-1021-nvidia` |
+| GPU driver / CUDA | `580.159.03` / CUDA 13.0 |
+| Container runtime | Docker with `--gpus all` |
+| sglang runtime base image | `lmsysorg/sglang:v0.5.14-cu130-runtime` @ `sha256:9e436f44…0ad2` (see `runtime/sglang/Dockerfile`) |
+| Served model | `Qwen/Qwen3.6-27B-FP8` @ revision `e89b16eb…6eb09` |
+| Context / pool | 262144 context, 1 running / 1 queued, `mem-fraction-static=0.60` (measured → 346,485-token pool) |
+| Measurements taken | 2026-06-29 (prep calibration + server-ready gates) |
+
 ## What's in the box
 
 - A **single launch path**: `systemd → dispatch.sh → sglang adapter`. Exactly one;
@@ -29,39 +45,62 @@ release ships only the **`agentic`** role (coding/general agent work), served as
   `reload`), and an **experimental** DFlash speculative-decoding path that is
   deliberately not a production candidate.
 
-## 5-minute install (operator)
+## Install the service
 
-Prerequisites: a DGX Spark (NVIDIA GB10), Docker with GPU support, the SGLang
-runtime image built (see `runtime/sglang/Dockerfile`), and the Qwen weights
-fetched (see `profiles/qwen36-27b-fp8/README.md`).
+This is a **reference blueprint to tailor locally**, not a clone-and-deploy
+image. The one piece that is inherently host-specific is the **runtime image ID
+pin**: the adapter refuses to launch any container whose image ID doesn't match
+the committed pin in `runtime/sglang/runtime-manifest.toml`, and a fresh
+`docker build` of the Dockerfile produces a *different* ID than the committed
+one. So you must build and re-pin **before** install. `scripts/build-runtime.sh`
+does both.
+
+The phases below are short on commands but not on wall-clock: a 27B cold load is
+~4 minutes, and the gated weight fetch is ~30 GB. See `docs/runbook.md` for
+operating the service after install.
+
+### 1. Prepare
 
 ```bash
-# 1. Fetch the baseline weights into your model cache (one-time).
-#    Qwen3.6-27B-FP8 is gated: accept the license on the repo page, then `hf auth login`.
+# 1a. Build the runtime image and pin its ID into the manifest (REQUIRED first).
+#     This rewrites runtime/sglang/runtime-manifest.toml:image_id to YOUR build.
+scripts/build-runtime.sh --update
+
+# 1b. Fetch the baseline weights into your model cache (one-time, ~30 GB).
+#     Qwen3.6-27B-FP8 is gated: accept the license on the repo page, then `hf auth login`.
 export MODEL_CACHE_ROOT=/srv/model-cache
 export HF_HOME="$MODEL_CACHE_ROOT"
 hf download Qwen/Qwen3.6-27B-FP8 \
   --revision e89b16ebf1988b3d6befa7de50abc2d76f26eb09
 
-# 2. Create your secret (operator-supplied; never handled by this repo).
+# 1c. Create your secret (operator-supplied; never handled by this repo).
 install -d -m 0700 ~/.config/dgx-spark-inference
 echo "SGLANG_API_KEY=$(openssl rand -hex 32)" > ~/.config/dgx-spark-inference/agent.env
 chmod 600 ~/.config/dgx-spark-inference/agent.env
+```
 
-# 3. Preview the install (renders the unit + config plan; writes nothing).
+### 2. Install
+
+```bash
+# 2a. Preview the install (renders the unit + config plan; writes nothing).
 deploy/install.sh --dry-run \
   --model-cache-root "$MODEL_CACHE_ROOT" \
   --agent-env ~/.config/dgx-spark-inference/agent.env
 
-# 4. Install (refuses to clobber; never starts the service).
+# 2b. Install (refuses to clobber existing files unless --replace; never starts the service).
 deploy/install.sh \
   --model-cache-root "$MODEL_CACHE_ROOT" \
   --agent-env ~/.config/dgx-spark-inference/agent.env
+```
 
-# 5. Start it (separate, reviewed operation).
+### 3. Activate
+
+```bash
+# 3a. Start it (cold load ~4 min for 27B; `systemctl start` returns immediately,
+#     readiness is when /health returns 200 — poll, don't trust the fast return).
 sudo systemctl start dgx-spark-inference.service
 
-# 6. Verify (read-only smoke gate — see docs/smoke-test.md).
+# 3b. Verify (read-only smoke gate — full version in docs/smoke-test.md).
 curl -s http://127.0.0.1:30000/health   # 200 = ready
 ```
 
@@ -71,6 +110,7 @@ curl -s http://127.0.0.1:30000/health   # 200 = ready
 - [`docs/architecture.md`](docs/architecture.md) — the binding system, request
   flow, and the honest role of the resolver.
 - [`docs/operations.md`](docs/operations.md) — status/candidates/use/lifecycle/health.
+- [`docs/runbook.md`](docs/runbook.md) — day-2 operations: diagnostics, rollback, upgrades.
 - [`docs/security.md`](docs/security.md) — the LAN-only firewall prerequisite.
 - [`docs/known-limitations.md`](docs/known-limitations.md) — GB10/DFlash/memory limits.
 - [`docs/smoke-test.md`](docs/smoke-test.md) — the release gate.
