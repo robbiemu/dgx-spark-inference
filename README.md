@@ -250,6 +250,107 @@ To promote a new role, you'll want:
 
 For a single role, none of this is required. But it matters once you're running more than one.
 
+---
+
+### Worked example: adding the Ornith-9B helper
+
+A concrete walkthrough of going from one role to two — a cheap/fast
+`agentic-helper` served by `Ornith-1.0-9B` (FP8) alongside the Qwen primary.
+Every number was measured on a Spark (`docs/v0_2_phase0_results.md`); substitute
+your own when you reproduce.
+
+The checked-in deployment is single-role: `install.sh` declares a fixed
+one-role/one-unit scope and ships one `inference-agentic.service.in` template.
+So below, the helper's profile, role binding, unit, and plan are **local files
+you add by hand** — there is no multi-role installer path yet. Treat this as
+"here is what changed on the machine," run as the operator, on the Spark.
+
+```bash
+# 1. Verify the existing primary is healthy before changing anything.
+INFCTL=/usr/local/lib/dgx-spark-inference/src/inferencectl/inference-cli.sh
+sudo CONFIG_ROOT=/etc/dgx-spark-inference "$INFCTL" status
+curl -s -o /dev/null -w "primary /health = %{http_code}\n" http://127.0.0.1:30000/health   # 200
+```
+
+```bash
+# 2. Create the hydrated Ornith bundle and hash it.
+#    The FP8 derivative (barryke/Ornith-1.0-9B-FP8-DYNAMIC) omits two processor
+#    configs that Ornith's processor stack needs even for text-only serving.
+#    Copy them from the BF16 base (vision_config is byte-identical -> compatible)
+#    and record a manifest. Do NOT source missing files at runtime (Frankenstein).
+BUNDLE=$MODEL_CACHE_ROOT/ornith-1.0-9b-fp8
+hf download barryke/Ornith-1.0-9B-FP8-DYNAMIC --local-dir "$BUNDLE"
+hf download deepreinforce-ai/Ornith-1.0-9B \
+  --include preprocessor_config.json video_preprocessor_config.json \
+  --local-dir /tmp/ornith-bf16-base
+cp /tmp/ornith-bf16-base/{preprocessor_config,video_preprocessor_config}.json "$BUNDLE/"
+( cd "$BUNDLE" && sha256sum * | tee HYDRATION_MANIFEST.md )
+```
+
+```bash
+# 3. Add the local profile, role binding, and helper unit (operator-written files;
+#    install.sh does not create these — it is single-role).
+#    - profiles/ornith-1.0-9b-fp8/{sglang.toml,capability.toml}: identity/revision
+#      + the helper's measured capability contract (chat/reasoning/tool/structured).
+#    - a role binding: append [roles.agentic-helper] to runtime/sglang/available.toml
+#      with served_model_name = "agentic-helper" and the candidate pointing at the profile.
+#    - /etc/systemd/system/inference-agentic-helper.service: hand-adapt the shipped
+#      inference-agentic.service.in — ROLE=agentic-helper, port 30001, container
+#      inference-agentic-helper. (There is no template-installer; you resolve the
+#      placeholders yourself.)
+```
+
+```bash
+# 4. Drop the matched ledger/plan pair into CONFIG_ROOT and enable required preflight.
+#    These come as a PAIR (atomic); exactly-one present is a refuse, never mix roots.
+cp tools/memory_planner/budget_ledger.toml /etc/dgx-spark-inference/memory_ledger.toml
+#    write /etc/dgx-spark-inference/memory_plan.toml for THIS host's residency:
+#      device.total_gib, [policy] memavailable_floor_gib, [[resident]] = primary,
+#      [[admit]] role=agentic-helper model_id=ornith-1.0-9b-fp8
+#      (see tools/memory_planner/plan_coresident.toml)
+#    then edit the helper unit to set: Environment=DGX_MEMORY_PREFLIGHT=required
+```
+
+```bash
+# 5. Reload systemd, start the helper, and inspect health + logs + realized pool.
+sudo systemctl daemon-reload
+sudo systemctl start inference-agentic-helper.service
+# cold load ~80s for the 9B; readiness is /health=200 (poll, don't trust the fast return).
+curl -s -o /dev/null -w "helper /health = %{http_code}\n" http://127.0.0.1:30001/health
+curl -s -o /dev/null -w "primary /health = %{http_code}\n" http://127.0.0.1:30000/health  # still 200
+sudo journalctl -u inference-agentic-helper.service -n 40 --no-pager
+# Confirm the realized pool is within the helper's contract band [min, cap]:
+KEY=$(sudo grep SGLANG_API_KEY /etc/dgx-spark-inference/agent.env | cut -d= -f2)
+curl -s -H "Authorization: Bearer $KEY" http://127.0.0.1:30001/get_server_info \
+  | jq '.max_total_num_tokens'   # expect within [32768, 376048]
+```
+
+```bash
+# 6. See what a refusal looks like — and that the primary stays up.
+#    Temporarily set the floor above what co-residency leaves (e.g. 50 GiB) in
+#    memory_plan.toml, restart the helper, and watch it refuse (exit 75):
+sudo systemctl restart inference-agentic-helper.service
+sudo journalctl -u inference-agentic-helper.service -n 15 --no-pager | grep -i refuse
+curl -s -o /dev/null -w "primary still /health = %{http_code}\n" http://127.0.0.1:30000/health
+#    then restore the real floor and restart.
+```
+
+> **Capability caveat for the helper contract.** Ornith-9B FP8 passed all four
+> helper gates (reasoning in its own field, tool-call parse via `qwen3_coder`,
+> multi-turn continuity, grammar-constrained `structured_output`). One
+> operational note: a constrained request needs generous `max_tokens` — Ornith
+> reasons heavily before emitting, and a low cap returns empty content (the same
+> budget lesson as the primary's long thinking traces). Record only what you
+> measured in `capability.toml`.
+
+> **Why a derived fraction, not a static one.** The same `mem_fraction_static`
+> reserves wildly different absolute pools depending on what's already resident
+> (proven the hard way: a static `0.80` helper fraction loaded *solo* against
+> ~124 GiB free reserved ~99 GiB and starved the primary). The planner derives
+> the fraction from the *measured* free GPU memory at launch (not the device
+> total) and pins the pool with a `max_total_tokens` cap, which makes the helper
+> safe to load in either order.
+
 ## Install the service
 
 This is a **reference blueprint to tailor locally**, not a clone-and-deploy
