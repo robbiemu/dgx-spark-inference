@@ -41,6 +41,222 @@ The measurements and behavior in this repo were validated on this configuration
   `reload`), and an **experimental** DFlash speculative-decoding path that is
   deliberately not a production candidate.
 
+
+### Details
+
+#### A small serving topology for one DGX Spark
+
+This repo runs one or more pinned models on a single Spark, each with its own named role, its own authenticated endpoint, and its own systemd lifecycle. When you want more than one model resident at a time, a shared admission lane makes sure they don't trip over each other reaching for the same pool of unified memory.
+
+---
+
+### The pieces
+
+```mermaid
+flowchart TB
+    OP[Operator] --> SYS[systemd unit per role]
+    SYS --> DISPATCH[dispatch.sh]
+    DISPATCH --> ADMISSION[admission.sh]
+    ADMISSION --> ADAPTER[SGLang adapter]
+    ADAPTER --> SGLANG[SGLang container]
+    SGLANG --> API[Authenticated API endpoint]
+
+    PROFILE[Model profile] --> DISPATCH
+    SECRET[Operator state + API key] --> DISPATCH
+    LEDGER[Memory budget ledger] --> ADMISSION
+    PLAN[Host memory plan] --> ADMISSION
+```
+
+Every role gets its own unit, its own endpoint, its own profile, and its own lifecycle. The one thing they share is the admission path — that's what serializes launches so two roles never try to allocate from the same memory pool at the same instant.
+
+---
+
+### Reference baseline
+
+Out of the box, the repo is set up to run one role like this:
+
+| Piece                | Reference configuration                     |
+| --------------------- | -------------------------------------------- |
+| Role                  | `agentic`                                    |
+| Profile               | `qwen36-27b-fp8`                             |
+| Model                 | `Qwen/Qwen3.6-27B-FP8` at a pinned revision   |
+| Context contract      | 262,144 tokens                               |
+| Baseline concurrency  | 1 running request, 1 queued request          |
+| Endpoint              | Authenticated local service on port `30000`  |
+| Unit                  | `inference-agentic.service`                  |
+
+The profile is where model identity, revision, quantization, and launch parameters all live. We don't ship weights in this repo — your host pulls them into its own Hugging Face cache the first time the role starts.
+
+---
+
+### Running a single role
+
+```mermaid
+flowchart LR
+    CLIENT[Agent client] -->|API key| A[agentic endpoint :30000]
+    A --> Q[Qwen 27B FP8]
+    Q --> GB10[GB10 unified memory]
+```
+
+If you just want one model running, this is all you need — the role starts up using the launch settings already recorded in its profile. Without a memory-planner pair installed, it falls back to whatever `mem_fraction_static` the profile has recorded, no extra setup required.
+
+---
+
+### Running two roles side by side
+
+```mermaid
+flowchart LR
+    C1[Agent client] --> P[Primary endpoint]
+    C2[Helper client] --> H[Helper endpoint]
+
+    P --> Q[Primary model]
+    H --> M[Helper model]
+
+    Q --> U[GB10 unified memory]
+    M --> U
+
+    Q -. resident state .-> A[Serialized admission lane]
+    M -. resident state .-> A
+```
+
+A primary model and a helper model can share the Spark, as long as their measured memory budgets actually fit together. Each new role you add needs its own profile, unit, endpoint, secret path, and ledger entry — the memory planner doesn't create any of that for you, it just decides whether a candidate is admitted once everything else is in place.
+
+---
+
+### What happens at launch
+
+```mermaid
+sequenceDiagram
+    participant S as systemd
+    participant D as dispatch.sh
+    participant A as admission.sh
+    participant R as memory resolver
+    participant X as SGLang adapter
+    participant G as SGLang server
+
+    S->>D: start role
+    D->>A: launch candidate
+    A->>A: acquire global flock
+    A->>A: discover managed residents
+    A->>A: measure free GPU + MemAvailable
+    A->>R: resolve candidate budget
+    R-->>A: ADMIT or REFUSE
+
+    alt budget fits
+        A->>X: derived env overrides
+        X->>G: start container
+        G-->>A: realized token pool
+        A->>A: verify role contract
+        A-->>D: release lock
+    else budget fails
+        A-->>S: exit 75, candidate refused
+    end
+```
+
+Every launch takes a global lock before it measures anything, and holds it through planning, launch, and verification. That's the whole point of the lock: a second role can't sneak in on a stale free-memory reading while the first role is still mid-allocation.
+
+---
+
+### The two SGLang memory knobs
+
+```text
+mem_fraction_static = static_required / A_preload
+max_total_tokens    = role-specific KV-pool ceiling
+```
+
+`mem_fraction_static` gets derived fresh from whatever GPU memory is free right before launch. `max_total_tokens` caps the KV pool at each role's configured ceiling, even if there's plenty of free memory when the process starts. Between the two, every role lands on a stable static-memory footprint no matter what order things came up in.
+
+I also went back through the rest looking for the same kind of empty-emphasis phrasing and found a couple more worth flattening:
+
+- "That's the whole point of the lock" (under "What happens at launch") → cut to just: "A second role can't sneak in on a stale free-memory reading while the first role is still mid-allocation."
+- "None of this is strictly required to run one model — it's what keeps things honest as the topology grows past one" (closing line) → maybe just: "For a single role, none of this is required. It matters once you're running more than one."
+
+Want me to fold those into the full doc and repost it clean, or are you handling the merge yourself from here?
+---
+
+### The measured budget ledger
+
+```toml
+[profiles.primary]
+weights_gib                    = <measured>
+target_pool_tokens             = <measured>
+minimum_admissible_pool_tokens = 262144
+kv_bytes_per_token             = <measured>
+static_overhead_gib            = <measured>
+cuda_graph_peak_gib            = <measured>
+request_workspace_gib          = <measured>
+
+[profiles.helper]
+weights_gib                    = <measured>
+target_pool_tokens             = <measured>
+minimum_admissible_pool_tokens = <role requirement>
+kv_bytes_per_token             = <measured>
+static_overhead_gib            = <measured>
+cuda_graph_peak_gib            = <measured>
+request_workspace_gib          = <measured>
+```
+
+Rather than keeping a separate budget for every possible combination of resident roles, the ledger just records measured numbers per profile. Add a role, add one profile entry — the admission logic figures out the rest at launch time.
+
+---
+
+### What can happen when you start a role
+
+| Situation                                        | Result                                                 |
+| -------------------------------------------------- | -------------------------------------------------------- |
+| Ledger and plan present; both gates pass          | Candidate starts and its realized pool is verified     |
+| Candidate would breach GPU or host-memory budget  | Candidate role is refused                               |
+| Candidate starts but realizes too few KV tokens   | Candidate is stopped and refused                         |
+| Existing co-resident is healthy                   | It keeps running, untouched                              |
+| Only one of the two planner files exists          | Refusal — planner state is treated as incomplete         |
+| No planner pair, mode is `auto`                   | Launch proceeds on the profile alone, no memory admission |
+| No planner pair, mode is `required`                | Candidate role is refused                                |
+
+If a role can't meet its contract, it gets refused on the spot — and refusing one role never means restarting or killing whatever else is already healthy and running.
+
+---
+
+### Turning memory admission on
+
+```text
+$CONFIG_ROOT/
+├── memory_ledger.toml
+└── memory_plan.toml
+```
+
+```ini
+# systemd unit environment
+DGX_MEMORY_PREFLIGHT=required
+```
+
+These two files come as a pair — they describe the same host and the same measured budgets, so they only make sense together. Setting `DGX_MEMORY_PREFLIGHT=required` is what makes the planner a hard requirement for a role to launch at all.
+
+---
+
+### Adding a new role
+
+```mermaid
+flowchart LR
+    P[Choose model profile] --> C[Record capability evidence]
+    C --> B[Measure memory budget]
+    B --> U[Add systemd unit + endpoint]
+    U --> L[Add ledger entry]
+    L --> T[Run no-GPU gate tests]
+    T --> G[Run GPU admission + service tests]
+```
+
+To promote a new role, you'll want:
+
+1. A pinned model profile.
+2. Evidence the model can actually do the work you're giving it.
+3. A measured memory budget.
+4. Its own unit, endpoint, secret path, and port.
+5. An update to the memory plan for the host topology.
+6. Confirmation on the Spark that it admits cleanly and realizes its expected pool.
+
+None of this is strictly required to run one model — it's what keeps things honest as the topology grows past one.
+
+
 ## Install the service
 
 This is a **reference blueprint to tailor locally**, not a clone-and-deploy
