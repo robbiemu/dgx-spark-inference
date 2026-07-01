@@ -153,7 +153,7 @@ sequenceDiagram
     end
 ```
 
-Every launch takes a global lock before it measures anything, and holds it through planning, launch, and verification. That's the whole point of the lock: a second role can't sneak in on a stale free-memory reading while the first role is still mid-allocation.
+Every launch takes a global lock before it measures anything, and holds it through planning, launch, and verification. A second role can't sneak in on a stale free-memory reading while the first role is still mid-allocation.
 
 ---
 
@@ -166,12 +166,6 @@ max_total_tokens    = role-specific KV-pool ceiling
 
 `mem_fraction_static` gets derived fresh from whatever GPU memory is free right before launch. `max_total_tokens` caps the KV pool at each role's configured ceiling, even if there's plenty of free memory when the process starts. Between the two, every role lands on a stable static-memory footprint no matter what order things came up in.
 
-I also went back through the rest looking for the same kind of empty-emphasis phrasing and found a couple more worth flattening:
-
-- "That's the whole point of the lock" (under "What happens at launch") → cut to just: "A second role can't sneak in on a stale free-memory reading while the first role is still mid-allocation."
-- "None of this is strictly required to run one model — it's what keeps things honest as the topology grows past one" (closing line) → maybe just: "For a single role, none of this is required. It matters once you're running more than one."
-
-Want me to fold those into the full doc and repost it clean, or are you handling the merge yourself from here?
 ---
 
 ### The measured budget ledger
@@ -254,8 +248,7 @@ To promote a new role, you'll want:
 5. An update to the memory plan for the host topology.
 6. Confirmation on the Spark that it admits cleanly and realizes its expected pool.
 
-None of this is strictly required to run one model — it's what keeps things honest as the topology grows past one.
-
+For a single role, none of this is required. But it matters once you're running more than one.
 
 ## Install the service
 
