@@ -93,4 +93,22 @@ PY
 [ "$KIND" = "$SPEC_KIND" ] || die "kind mismatch: available says '$KIND', spec says '$SPEC_KIND'"
 
 echo "[dispatch] role=$ROLE model=$MODEL_ID kind=$KIND runtime=$(basename "$RUNTIME_ROOT") served=$SERVED"
+
+# Memory preflight (v0.2): when enrolled (DGX_MEMORY_PREFLIGHT), route through
+# admission.sh — the serialized admission wrapper that holds a global lock across
+# discover->sample->resolve->launch->VERIFY-allocation, closing the preflight<->
+# allocation race. Passes the adapter path as the 8th arg so admission.sh can
+# exec the real adapter after verified admission. Legacy v0.1 roles (preflight
+# unset/auto with no planner pair) exec the adapter directly, unchanged.
+# Only the MEMORY resolver is wired (capability resolver stays off the live path).
+ADMISSION="${DGX_ADMISSION_SH:-$PROJECTS_ROOT/src/inferencectl/admission.sh}"
+if [ "${DGX_MEMORY_PREFLIGHT:-auto}" != "auto" ] || {
+     # auto mode: enroll only if a matched planner pair exists in CONFIG_ROOT.
+     [ -f "${CONFIG_ROOT}/memory_ledger.toml" ] && [ -f "${CONFIG_ROOT}/memory_plan.toml" ]
+   }; then
+  if [ -x "$ADMISSION" ] || [ -f "$ADMISSION" ]; then
+    exec "$ADMISSION" "$ROLE" "$RUNTIME_ROOT" "$PROJECTS_ROOT" "$MODEL_ID" "$KIND" "$SPEC" "$SERVED" "$ADAPTER"
+  fi
+  echo "[dispatch] WARN: admission.sh not found ($ADMISSION); legacy launch" >&2
+fi
 exec "$ADAPTER" "$ROLE" "$RUNTIME_ROOT" "$PROJECTS_ROOT" "$MODEL_ID" "$KIND" "$SPEC" "$SERVED"

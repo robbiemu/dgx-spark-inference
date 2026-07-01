@@ -54,6 +54,9 @@ python3 tests/test_experimental_isolation.py || fail=1
 say "Test 7 — memory env-var override tier (DGX_MEM_FRACTION_STATIC / DGX_MAX_TOTAL_TOKENS)"
 python3 tests/test_memory_env_override.py || fail=1
 
+say "Test 8 — admission serialized (race closed; knobs exported; refuse safe; legacy preserved)"
+python3 tests/test_admission_serialized.py || fail=1
+
 say "Repository-wide contextual secret scan"
 python3 tests/scan_secrets.py "$ROOT" || fail=1
 
