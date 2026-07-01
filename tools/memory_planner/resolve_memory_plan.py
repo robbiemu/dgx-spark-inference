@@ -211,6 +211,15 @@ def resolve(ledger_path: str, plan_path: str, dry_run: bool = False) -> int:
 
     device_total_gib = float(plan["device"]["total_gib"])
     memavailable_start_gib = float(plan["observed"]["memavailable_now_gib"])
+    # Live mode (Blocker 1 fix): when observed.gpu_free_now_gib is present, it is
+    # the MEASURED free GPU memory immediately before launch — the true A_preload.
+    # It ALREADY includes resident allocations, so residents must NOT be subtracted
+    # again (only used for identity/revision/guard checks). When absent (offline/
+    # planning mode), fall back to device_total_gib and subtract resident peaks.
+    gpu_free_now = plan.get("observed", {}).get("gpu_free_now_gib")
+    has_live_free = gpu_free_now is not None
+    if has_live_free:
+        gpu_free_now = float(gpu_free_now)
 
     # The MemAvailable floor is a HOST-WIDE policy (how much system memory this
     # machine must keep free under GB10 unified memory), NOT a per-model property.
@@ -227,18 +236,13 @@ def resolve(ledger_path: str, plan_path: str, dry_run: bool = False) -> int:
 
     results: list[AdmissionResult] = []
     any_fail = False
-    # Two running counters, both reduced by each model's PEAK:
-    #   gpu_free:       what the GPU allocator sees as free at each load (A_preload)
-    #   memavailable:   host MemAvailable, reduced by each model's peak (Linux gate)
-    # The plan's memavailable_now_gib is OBSERVED REALITY (reflects already-resident models).
-    gpu_free_gib = device_total_gib
+    # gpu_free is the A_preload each candidate sees. In LIVE mode it starts from the
+    # MEASURED gpu_free_now_gib (which already includes resident allocations — do NOT
+    # subtract residents again). In OFFLINE/planning mode it starts at device_total
+    # and resident peaks are subtracted (reconstruction, less accurate).
+    gpu_free_gib = gpu_free_now if has_live_free else device_total_gib
     memavailable_gib = memavailable_start_gib
 
-    # First, account for ALREADY-RESIDENT models (their peak is already consumed;
-    # MemAvailable already reflects this). They reduce gpu_free but do NOT go through
-    # gates (they're already running). They reduce MemAvailable too, but since the
-    # observed value already accounts for them, we instead TRUST the observed value
-    # for MemAvailable and only reduce gpu_free by their peak (the GPU allocator view).
     resident = plan.get("resident", [])
     if resident:
         print(f"# already resident: {[r['model_id'] for r in resident]}")
@@ -247,8 +251,15 @@ def resolve(ledger_path: str, plan_path: str, dry_run: bool = False) -> int:
             if mid not in budgets:
                 print(f"REFUSING: resident references unknown model '{mid}'", file=sys.stderr)
                 return ([], 2)
-            gpu_free_gib -= budgets[mid].peak_required_gib
-        print(f"#   (their peak consumed; MemAvailable={memavailable_gib:.1f} is observed post-resident)\n")
+            if not has_live_free:
+                # OFFLINE mode only: reconstruct gpu_free by subtracting resident peaks.
+                # LIVE mode: gpu_free_now already includes them — do not double-subtract.
+                gpu_free_gib -= budgets[mid].peak_required_gib
+        if has_live_free:
+            print(f"#   (residents present but NOT subtracted: gpu_free_now already includes them)")
+        else:
+            print(f"#   (their peak subtracted in offline mode; MemAvailable={memavailable_gib:.1f} is observed)")
+        print()
 
     print(f"# memory plan — device {device_total_gib:.1f} GiB, "
           f"MemAvailable now {memavailable_gib:.1f} GiB\n")

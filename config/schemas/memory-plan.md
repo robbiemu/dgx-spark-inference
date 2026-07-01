@@ -66,9 +66,11 @@ components alone. That asymmetry is real and model-size-dependent.
 - `memavailable_floor_gib` — the **hard refusal line**: the planner refuses to
   admit a model whose load would push system MemAvailable below this.
 
-**Layering** (authoritative → fallback): plan `[policy]` > ledger per-model value
-> built-in default `8.0`. The floor is host-wide policy, never hardcoded in the
-resolver.
+**Layering** (authoritative → fallback): `DGX_MEMAVAILABLE_FLOOR_GIB` (env override)
+> installed `memory_plan.toml [policy]` > built-in default `6.0`. Enforced on the
+live path by `admission.sh::resolve_floor`, which parses the installed plan's
+`[policy]`, validates the resolved value is a finite positive number, and never
+silently substitutes the default. (An operator's configured 8.0 is honored.)
 
 > **Gloss / tuning note.** `memavailable_floor_gib` is the line between "marginal
 > but runs" and "refuse to start." On GB10 (121 GiB unified memory), fitting a 27B
@@ -89,6 +91,13 @@ resolver.
 GPU gate:   A_preload − static_required  ≥  graph_peak + workspace + gpu_headroom
 Linux gate: MemAvailable_after_load       ≥  memavailable_floor_gib
 ```
+**`A_preload` is the MEASURED free GPU memory** (`observed.gpu_free_now_gib`, sampled
+via `torch.cuda.mem_get_info` immediately before launch), NOT `device.total_gib`. In
+live mode the measurement already includes resident allocations, so residents are NOT
+subtracted again (they're for identity/revision/guard checks only). A GPU-probe
+failure REFUSES in both auto and required modes once a pair exists — the resolver
+must never derive a fraction from a synthetic/invented A_preload.
+
 A model that fails either gate is refused **before the GPU is touched**. A failed
 slot does not reduce the running counters for subsequent slots (one bad record
 cannot cascade a false fit). The dispatcher emits, per admitted model:

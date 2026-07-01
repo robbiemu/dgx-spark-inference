@@ -43,6 +43,7 @@ model_id = "ornith-1.0-9b-bf16"
 [profiles.budget]
 weights_gib            = 17.17
 target_kv_tokens       = 268319
+minimum_admissible_pool_tokens = 32768   # helper role floor (same as FP8); refuse if realized < this
 kv_bytes_per_token     = 65536.0
 static_pad_gib         = 0.5
 cuda_graph_peak_gib    = 1.26        # measured (probe4.log)

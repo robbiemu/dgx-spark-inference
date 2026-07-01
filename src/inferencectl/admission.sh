@@ -40,7 +40,8 @@ PLANNER="${DGX_MEMORY_PLANNER:-$PROJECT_ROOT/tools/memory_planner/resolve_memory
 LEDGER="${DGX_MEMORY_LEDGER:-$CONFIG_ROOT/memory_ledger.toml}"
 PLAN="${DGX_MEMORY_PLAN:-$CONFIG_ROOT/memory_plan.toml}"
 PREFLIGHT="${DGX_MEMORY_PREFLIGHT:-auto}"   # auto | required | off
-FLOOR="${DGX_MEMAVAILABLE_FLOOR_GIB:-6.0}"
+# FLOOR is resolved AFTER the pair check (Blocker 3): layered
+#   DGX_MEMAVAILABLE_FLOOR_GIB (env) > installed memory_plan.toml [policy] > default 6.0
 LOCK="${DGX_ADMISSION_LOCK:-/run/dgx-inference-admission.lock}"
 PORT="${PORT:-30000}"
 ADMISSION_READY_TIMEOUT="${DGX_ADMISSION_READY_TIMEOUT:-300}"  # sec to verify allocation
@@ -83,6 +84,39 @@ fi
 
 [ -x "$PLANNER" ] || [ -f "$PLANNER" ] || die "planner not found: $PLANNER"
 
+# ---- resolve the MemAvailable floor (Blocker 3: layered, honors installed plan) -
+# Layering: DGX_MEMAVAILABLE_FLOOR_GIB (env override) > installed memory_plan.toml
+# [policy].memavailable_floor_gib > default 6.0. An operator's configured floor in
+# the installed plan must NOT be silently replaced by the default.
+resolve_floor() {
+  local plan_floor
+  plan_floor="$(python3 - "$PLAN" <<'PY'
+import sys, tomllib
+try:
+    p = tomllib.load(open(sys.argv[1],"rb"))
+    v = p.get("policy", {}).get("memavailable_floor_gib")
+    if v is None: sys.exit(1)
+    f = float(v)
+    if not (f == f and f > 0):  # NaN or non-positive -> invalid
+        sys.exit(2)
+    print(f)
+except Exception:
+    sys.exit(1)
+PY
+)" || plan_floor=""
+  if [ -n "${DGX_MEMAVAILABLE_FLOOR_GIB:-}" ]; then
+    printf '%s' "$DGX_MEMAVAILABLE_FLOOR_GIB"
+  elif [ -n "$plan_floor" ]; then
+    printf '%s' "$plan_floor"
+  else
+    printf '6.0'
+  fi
+}
+FLOOR="$(resolve_floor)"
+# validate the resolved floor is a finite positive number before it reaches TOML.
+python3 -c "f=float('$FLOOR'); assert f==f and f>0" 2>/dev/null \
+  || die "resolved memavailable_floor_gib is not a finite positive number: '$FLOOR'"
+
 # ---- the serialized admission lock -----------------------------------------
 # Hold across discover->sample->resolve->launch->VERIFY. flock is released when
 # the holding fd closes (on exec-via-wait or exit). We open it on fd 9.
@@ -91,35 +125,41 @@ log "acquiring admission lock ($LOCK)..."
 flock 9
 log "lock held"
 
-# ---- discover residents (label-based, no name inference) -------------------
-# Residents are discovered by io.inferencectl.managed label (set by the adapter
-# on every managed launch), NOT by container name (name is mutable/operator-set;
-# the label carries the stable planner identity). Residents' peak is already
-# consumed, so they reduce the GPU free the candidate sees.
-residents_block=""
+# ---- discover residents (label-based, for guards only) ---------------------
+# In LIVE mode (Blocker 1) residents are NOT subtracted from A_preload — the
+# measured gpu_free_now_gib already includes them. Discovery remains for:
+# identity/revision checks and the unmanaged-GPU-tenant guard.
 if command -v docker >/dev/null 2>&1; then
-  others=$(docker ps --filter "label=io.inferencectl.managed=true" \
-                     --format '{{.Label "io.inferencectl.memory_profile"}}' 2>/dev/null \
-           | grep -v "^${MODEL_ID}\$" || true)
-  if [ -n "$others" ]; then
-    while IFS= read -r prof; do
-      [ -n "$prof" ] && residents_block="${residents_block}[[resident]]
-model_id = \"${prof}\"
-"
-    done <<<"$others"
+  # Ledger-revision check: export DGX_MEMORY_LEDGER so the adapter stamps the
+  # io.inferencectl.ledger_revision label; here we compute the expected revision
+  # and refuse in required mode if any resident's revision is absent/mismatched
+  # (a stale resident from a different ledger generation would invalidate the plan).
+  EXPECTED_REV=""
+  [ -f "$LEDGER" ] && EXPECTED_REV="$(sha256sum "$LEDGER" 2>/dev/null | cut -c1-16)"
+  export DGX_MEMORY_LEDGER="$LEDGER"   # so the adapter labels the new container
+  if [ -n "$EXPECTED_REV" ] && [ "$PREFLIGHT" = "required" ]; then
+    bad_rev=$( { docker ps --filter "label=io.inferencectl.managed=true" \
+                   --format '{{.Label "io.inferencectl.ledger_revision"}}' \
+                 | awk -v exp="$EXPECTED_REV" '$1 != exp {print "mismatch"}'; } 2>/dev/null || true)
+    if [ -n "$bad_rev" ]; then
+      die "managed mode: a resident's ledger_revision differs from the current ledger (stale resident; restart it under the new ledger)"
+    fi
   fi
-  # Unknown GPU-holding container guard (managed mode): any container using the
-  # GPU that is NOT io.inferencectl.managed (and not this short-lived probe) is
-  # an unaccounted memory consumer. In required mode, REFUSE — the plan cannot
-  # reason about unmanaged residents, and silently ignoring them is fail-open.
-  # (The CUDA probe container here is transient and does not hold a GPU lease.)
+  # Unmanaged GPU-tenant guard (required mode): inspect DeviceRequests (the real
+  # GPU allocation) — only containers that actually request a GPU and are NOT
+  # io.inferencectl.managed are refused. A CPU-only sidecar/monitor does not
+  # consume GPU memory and is already accounted for in MemAvailable.
   if [ "$PREFLIGHT" = "required" ]; then
-    # crude GPU-tenant check: containers with --gpus are not directly listable,
-    # so we rely on the managed label; an unmanaged container counts as unknown.
-    unmanaged=$( { docker ps --format '{{.Names}}\t{{.Label "io.inferencectl.managed"}}' \
-                  | awk -F'\t' '$2 != "true" {print $1}'; } 2>/dev/null || true)
-    if [ -n "$unmanaged" ]; then
-      die "managed mode: unmanaged container(s) present ($(echo $unmanaged | tr '\n' ' ')); cannot reason about unaccounted GPU memory"
+    gpu_unmanaged=$( { for c in $(docker ps --format '{{.Names}}'); do
+          dr=$(docker inspect "$c" --format '{{json .HostConfig.DeviceRequests}}' 2>/dev/null || echo "null")
+          managed=$(docker inspect "$c" --format '{{index .Config.Labels "io.inferencectl.managed"}}' 2>/dev/null || true)
+          # DeviceRequests non-null/non-empty AND not managed -> unmanaged GPU tenant
+          if [ "$dr" != "null" ] && [ -n "$dr" ] && [ "$dr" != "[]" ] && [ "$managed" != "true" ]; then
+            echo "$c"
+          fi
+        done; } 2>/dev/null || true)
+    if [ -n "$gpu_unmanaged" ]; then
+      die "managed mode: unmanaged GPU container(s) present ($(echo $gpu_unmanaged | tr '\n' ' ')); cannot reason about unaccounted GPU memory"
     fi
   fi
 fi
@@ -139,9 +179,11 @@ PY
 }
 gpu_line="$(probe_gpu || true)"
 if [ -z "$gpu_line" ]; then
-  if [ "$PREFLIGHT" = "required" ]; then die "managed mode: GPU free-memory probe failed (refuse; cannot derive fraction)"; fi
-  log "WARN: GPU probe failed (auto mode) — falling back to /proc/meminfo only (GPU gate skipped)"
-  gpu_free=""; gpu_total=""
+  # Blocker 4: once a pair exists and preflight has begun, a GPU-probe failure
+  # REFUSES in BOTH auto and required modes. Feeding the resolver a synthetic
+  # total would look like success with an invented A_preload (fail-open). The
+  # only mode difference is the no-pair case (handled above: auto legacy-launches).
+  die "GPU free-memory probe failed (refuse; cannot derive fraction from a synthetic value)"
 else
   gpu_free="$(echo "$gpu_line" | awk '{print $2}')"
   gpu_total="$(echo "$gpu_line" | awk '{print $4}')"
@@ -150,23 +192,31 @@ memavail_kib="$(awk '/MemAvailable/ {print $2}' /proc/meminfo)"
 memavail_gib="$(python3 -c "print(${memavail_kib}/1048576)")"
 
 # ---- build the transient plan + run the resolver (--format json) -----------
+# Blocker 1: pass the MEASURED gpu_free_now_gib as the A_preload. The resolver
+# uses it directly and does NOT subtract residents again (the measurement already
+# includes resident allocations). Residents are for identity/revision/guard checks.
 PLAN_TMP="$(mktemp --suffix=.toml)"
 cat > "$PLAN_TMP" <<EOF
 device.total_gib = ${gpu_total:-121.7}
 [policy]
 memavailable_floor_gib = ${FLOOR}
 [observed]
+gpu_free_now_gib = ${gpu_free}
 memavailable_now_gib = ${memavail_gib}
-${residents_block}
 [[admit]]
 role = "${ROLE}"
 model_id = "${MODEL_ID}"
 EOF
-log "resolving memory plan (floor=${FLOOR}G, memavail=${memavail_gib}G, gpu_free=${gpu_free:-unknown}G)..."
+log "resolving memory plan (floor=${FLOOR}G, memavail=${memavail_gib}G, gpu_free=${gpu_free}G)..."
 PLANNER_ERR="$(mktemp)"
 trap 'rm -f "$PLAN_TMP" "$PLANNER_ERR"' EXIT
-JSON_OUT="$(python3 "$PLANNER" "$LEDGER" "$PLAN_TMP" --format json 2>"$PLANNER_ERR")" \
-  || JSON_OUT=""
+# Capture stdout and rc SEPARATELY (correction): the resolver exits nonzero for a
+# valid REFUSE, and `|| JSON_OUT=""` would discard the structured JSON, losing the
+# ability to distinguish an intentional gate failure from malformed output.
+set +e
+JSON_OUT="$(python3 "$PLANNER" "$LEDGER" "$PLAN_TMP" --format json 2>"$PLANNER_ERR")"
+RESOLVER_RC=$?
+set -e
 # parse the JSON for THIS model's derived knobs (stdlib; no grep on prose).
 # JSON passed via env (DGX_PARSE_JSON), not stdin — a bash heredoc would consume
 # stdin as the script source and break json.load.
@@ -263,6 +313,13 @@ if ! verify_ready; then
   log "ERROR: allocation not verified within ${ADMISSION_READY_TIMEOUT}s — killing adapter"
   kill "$ADAPTER_PID" 2>/dev/null || true
   wait "$ADAPTER_PID" 2>/dev/null || true
+  # Hardening: deterministically remove the candidate container. The adapter runs
+  # docker with --rm, but killing the foreground docker client may not propagate
+  # cleanly, leaving an unverified model resident. docker rm -f is bounded to THIS
+  # container name (the candidate), never a co-resident.
+  if [ -n "${CONTAINER_NAME:-}" ] && command -v docker >/dev/null 2>&1; then
+    docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  fi
   # release the lock (fd 9 closes on exit)
   die "role '$ROLE' failed admission verification (co-residents untouched)"
 fi

@@ -94,21 +94,24 @@ PY
 
 echo "[dispatch] role=$ROLE model=$MODEL_ID kind=$KIND runtime=$(basename "$RUNTIME_ROOT") served=$SERVED"
 
-# Memory preflight (v0.2): when enrolled (DGX_MEMORY_PREFLIGHT), route through
-# admission.sh — the serialized admission wrapper that holds a global lock across
-# discover->sample->resolve->launch->VERIFY-allocation, closing the preflight<->
-# allocation race. Passes the adapter path as the 8th arg so admission.sh can
-# exec the real adapter after verified admission. Legacy v0.1 roles (preflight
-# unset/auto with no planner pair) exec the adapter directly, unchanged.
-# Only the MEMORY resolver is wired (capability resolver stays off the live path).
+# Memory preflight (v0.2): dispatch is a THIN DELEGATE — it does NOT duplicate
+# the wrapper's enrollment/pair-state logic (that was a fail-open path: in auto
+# mode a lone planner file silently legacy-launched, bypassing the wrapper's
+# matched-pair check). The single rule:
+#   DGX_MEMORY_PREFLIGHT=off  -> direct adapter launch (explicit manual bypass)
+#   auto | required           -> ALWAYS enter admission.sh; the wrapper is the
+#                                sole gatekeeper (it decides pair state, probes,
+#                                gates, and refuses fail-closed as appropriate).
+# Under `required`, a missing admission.sh is a REFUSE (not a silent legacy fall-
+# back). Only the MEMORY resolver is wired; capability resolver stays off-path.
 ADMISSION="${DGX_ADMISSION_SH:-$PROJECTS_ROOT/src/inferencectl/admission.sh}"
-if [ "${DGX_MEMORY_PREFLIGHT:-auto}" != "auto" ] || {
-     # auto mode: enroll only if a matched planner pair exists in CONFIG_ROOT.
-     [ -f "${CONFIG_ROOT}/memory_ledger.toml" ] && [ -f "${CONFIG_ROOT}/memory_plan.toml" ]
-   }; then
+if [ "${DGX_MEMORY_PREFLIGHT:-auto}" != "off" ]; then
   if [ -x "$ADMISSION" ] || [ -f "$ADMISSION" ]; then
     exec "$ADMISSION" "$ROLE" "$RUNTIME_ROOT" "$PROJECTS_ROOT" "$MODEL_ID" "$KIND" "$SPEC" "$SERVED" "$ADAPTER"
   fi
-  echo "[dispatch] WARN: admission.sh not found ($ADMISSION); legacy launch" >&2
+  if [ "${DGX_MEMORY_PREFLIGHT:-auto}" = "required" ]; then
+    echo "ERROR: REFUSING: required mode but admission.sh not found ($ADMISSION)" >&2; exit 75
+  fi
+  echo "[dispatch] WARN: admission.sh not found ($ADMISSION); legacy launch (auto mode)" >&2
 fi
 exec "$ADAPTER" "$ROLE" "$RUNTIME_ROOT" "$PROJECTS_ROOT" "$MODEL_ID" "$KIND" "$SPEC" "$SERVED"

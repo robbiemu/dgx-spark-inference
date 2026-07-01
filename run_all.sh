@@ -60,6 +60,9 @@ python3 tests/test_admission_serialized.py || fail=1
 say "Test 9 — admission matched-pair atomicity + GPU-probe fail-closed"
 python3 tests/test_admission_pair_atomicity.py || fail=1
 
+say "Test 10 — admission live-path invariants (review blockers: dispatch delegation, measured A_preload, plan floor, probe-fail-auto)"
+python3 tests/test_admission_live_path.py || fail=1
+
 say "Repository-wide contextual secret scan"
 python3 tests/scan_secrets.py "$ROOT" || fail=1
 

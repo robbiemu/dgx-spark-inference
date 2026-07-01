@@ -148,6 +148,50 @@ def main():
     check("REFUSE json result is REFUSE", doc2.get("result") == "REFUSE", f"got {doc2.get('result')}")
     check("REFUSE exit code 1", proc2.returncode == 1, f"rc={proc2.returncode}")
 
+    print("=== T12: LIVE mode — gpu_free_now_gib is the A_preload (Blocker 1) ===")
+    # Reviewer test #3: with measured FREE_GIB=40, the derived fraction must equal
+    # static_required/40, NOT static_required/121.7 or a reconstructed resident estimate.
+    LIVE_PLAN = os.path.join(os.path.dirname(__file__), "_live_plan.toml")
+    open(LIVE_PLAN, "w").write(
+        "device.total_gib = 121.7\n"
+        "[observed]\n"
+        "gpu_free_now_gib = 40.0\n"
+        "memavailable_now_gib = 45.0\n"
+        "[[admit]]\nrole='r'\nmodel_id='ornith-1.0-9b-fp8'\n")
+    proc3 = subprocess.run([sys.executable, RESOLVER, LEDGER_P, LIVE_PLAN, "--format", "json"],
+                           capture_output=True, text=True)
+    os.remove(LIVE_PLAN)
+    try: doc3 = _json.loads(proc3.stdout)
+    except Exception: doc3 = {}
+    helper_live = next((m for m in doc3.get("models", []) if m["model_id"] == "ornith-1.0-9b-fp8"), {})
+    live_frac = helper_live.get("mem_fraction_static")
+    expected = helper.static_required_gib / 40.0
+    check("LIVE fraction = static_required/40 (uses measured FREE_GIB)",
+          approx(live_frac, expected, 0.01), f"got {live_frac}, expected ~{expected:.4f}")
+    check("LIVE fraction is NOT the /121.7 value",
+          not approx(live_frac, helper.static_required_gib / 121.7, 0.02),
+          f"got {live_frac} (would be {helper.static_required_gib/121.7:.4f} if /121.7)")
+    print(f"    live frac={live_frac}  expected(static/40)={expected:.4f}")
+
+    print("=== T13: LIVE mode does NOT subtract residents (already in the measurement) ===")
+    LIVE_PLAN2 = os.path.join(os.path.dirname(__file__), "_live_plan2.toml")
+    open(LIVE_PLAN2, "w").write(
+        "device.total_gib = 121.7\n"
+        "[observed]\n"
+        "gpu_free_now_gib = 40.0\n"
+        "memavailable_now_gib = 45.0\n"
+        "[[resident]]\nmodel_id='qwen36-27b-fp8'\n"
+        "[[admit]]\nrole='r'\nmodel_id='ornith-1.0-9b-fp8'\n")
+    proc4 = subprocess.run([sys.executable, RESOLVER, LEDGER_P, LIVE_PLAN2, "--format", "json"],
+                           capture_output=True, text=True)
+    os.remove(LIVE_PLAN2)
+    try: doc4 = _json.loads(proc4.stdout)
+    except Exception: doc4 = {}
+    h4 = next((m for m in doc4.get("models", []) if m["model_id"] == "ornith-1.0-9b-fp8"), {})
+    check("LIVE + resident: fraction unchanged (no double-subtract)",
+          approx(h4.get("mem_fraction_static"), live_frac, 0.01),
+          f"got {h4.get('mem_fraction_static')} vs no-resident {live_frac}")
+
     print(f"\n=== {passed} passed, {failed} failed ===")
     return 1 if failed else 0
 
