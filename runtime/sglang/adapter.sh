@@ -207,8 +207,19 @@ EOF
   MFS="${DGX_MEM_FRACTION_STATIC:-$(pick_optional "$SPEC_PATH" "$MANIFEST" launch.mem_fraction_static common_launch.mem_fraction_static || true)}"
   MTT="${DGX_MAX_TOTAL_TOKENS:-}"
   emit_yaml write "$CTX" "$MR" "$MQ" "$MFS" "$MTT" "$SGLANG_API_KEY"
+  # Durable labels for resident discovery (admission.sh finds co-residents by
+  # label, NOT by container name — name is mutable/operator-set, label is the
+  # stable planner identity). ledger_revision ties the resident to the exact
+  # budget-ledger generation (empty if no ledger, i.e. legacy/unmanaged launch).
+  LEDGER_REV=""
+  [ -n "${DGX_MEMORY_LEDGER:-}" ] && [ -f "$DGX_MEMORY_LEDGER" ] \
+    && LEDGER_REV="$(sha256sum "$DGX_MEMORY_LEDGER" 2>/dev/null | cut -c1-16)"
   exec /usr/bin/docker run \
     --rm --name "$CONTAINER_NAME" --gpus all --ipc host \
+    --label io.inferencectl.managed=true \
+    --label io.inferencectl.role="${ROLE}" \
+    --label io.inferencectl.memory_profile="${MODEL_ID}" \
+    --label io.inferencectl.ledger_revision="${LEDGER_REV}" \
     --publish "${HOST_BIND}:${PORT}:${PORT}" \
     --volume "${MODEL_CACHE_ROOT}:${CACHE_ROOT}:ro" \
     --volume "${RUNTIME_CONFIG_HOST}:${RUNTIME_CONFIG_CONTAINER}:ro" \
@@ -244,8 +255,15 @@ EOF
   MFS="${DGX_MEM_FRACTION_STATIC:-$(pick_optional "$SPEC_PATH" "$MANIFEST" launch.mem_fraction_static common_launch.mem_fraction_static || true)}"
   MTT="${DGX_MAX_TOTAL_TOKENS:-}"
   emit_yaml write "$CTX" "$MR" "$MQ" "$MFS" "$MTT" "$SGLANG_API_KEY"
+  LEDGER_REV=""
+  [ -n "${DGX_MEMORY_LEDGER:-}" ] && [ -f "$DGX_MEMORY_LEDGER" ] \
+    && LEDGER_REV="$(sha256sum "$DGX_MEMORY_LEDGER" 2>/dev/null | cut -c1-16)"
   exec /usr/bin/docker run \
     --rm --name "$CONTAINER_NAME" --gpus all --ipc host \
+    --label io.inferencectl.managed=true \
+    --label io.inferencectl.role="${ROLE}" \
+    --label io.inferencectl.memory_profile="${MODEL_ID}" \
+    --label io.inferencectl.ledger_revision="${LEDGER_REV}" \
     --publish "${HOST_BIND}:${PORT}:${PORT}" \
     --volume "${MODEL_CACHE_ROOT}:${CACHE_ROOT}:ro" \
     --volume "${DRAFTER_HOST_PATH}:/drafter:ro" \

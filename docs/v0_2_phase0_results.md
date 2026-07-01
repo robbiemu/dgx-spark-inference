@@ -470,20 +470,38 @@ than the planner's predicted ~6.5 GiB. This means the ledger's
 the 6.0 floor has substantially more margin than modeled. Confirms the schema-doc
 note that tightening those measurements may admit a higher floor later.
 
-## Phase 1 — open tasks (the research is done; these are implementation)
+## Phase 1 — implementation status (the research is done)
 
-1. **Resolver** — `tools/memory_planner/resolve_memory_plan.py` is built, tested
-   (10/10), and its order-independence claim is **now GPU-verified**. Remaining
-   work: wire it into `dispatch.sh` as a preflight (derive the two knobs, write
-   them to the runtime YAML, refuse on gate failure).
-   ✅ core done · ✅ verified · ⏳ dispatcher integration.
-2. **Hermes real-workflow test** — Phase 0c ran synthetic gates; run a real hermes
-   session against the helper endpoint before final promotion.
-3. **Budget-ledger tightening** — `cuda_graph_peak_gib` and
+1. **Resolver** — ✅ done. `tools/memory_planner/resolve_memory_plan.py` is built,
+   tested (20/20: algebra + `--format json` contract), and its order-independence
+   claim is **GPU-verified**. Derives `mem_fraction_static` + `max_total_tokens`
+   from the measured budget ledger; `--format json` is the dispatch contract.
+2. **Dispatcher wiring + serialized admission** — ✅ done.
+   `src/inferencectl/admission.sh` is the serialized admission wrapper: holds a
+   global `flock` across discover → sample → resolve → launch → **verified
+   allocation** (closing the preflight↔allocation race), refuses (exit 75) on gate
+   failure, clears inherited `DGX_MEM_*`, and verifies realized capacity via
+   `/get_server_info` before releasing the lock. `dispatch.sh` routes through it
+   when a planner pair is enrolled; legacy single-role launches unchanged. Adapter
+   gained the `DGX_MEM_FRACTION_STATIC`/`DGX_MAX_TOTAL_TOKENS` env override tier +
+   `max-total-tokens` emission + durable `io.inferencectl.*` labels. Test gate:
+   T7–T9 (env override, serialization, matched-pair atomicity/fail-closed) — 9/9
+   functional tests pass.
+3. **Hermes real-workflow test** — ⏳ open. Phase 0c ran synthetic gates; run a
+   real hermes session against the helper endpoint before final promotion.
+4. **Budget-ledger tightening** — ⏳ open. `cuda_graph_peak_gib` and
    `request_workspace_gib` are currently conservative estimates (the order probe
    showed steady-state MemAvailable ~27 GiB vs the predicted ~6.5 — the
    workspace estimate especially over-counts). Measuring them precisely would
    tighten the gates and likely admit a higher `memavailable_floor_gib`.
+
+### Not yet done (deferred / operator steps)
+- **Production enablement**: dropping a matched `memory_ledger.toml` +
+  `memory_plan.toml` into `CONFIG_ROOT` + setting `DGX_MEMORY_PREFLIGHT=required`
+  on the unit (operator/systemd step). Until then the live service runs legacy
+  (`auto`, no pair) — the wrapper is wired but inert.
+- **`Restart=` policy** for exit 75: currently `Restart=always` + burst cap; an
+  operator may make 75 non-retryable. Documented; not changed.
 
 ## State left behind
 

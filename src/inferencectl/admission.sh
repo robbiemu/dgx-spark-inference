@@ -58,20 +58,27 @@ if [ "$PREFLIGHT" = "off" ]; then
 fi
 
 # Matched-pair check (atomic — never mix CONFIG_ROOT file with a repo copy).
-has_pair=0
-if [ -f "$LEDGER" ] && [ -f "$PLAN" ]; then has_pair=1; fi
-if [ "$PREFLIGHT" = "required" ]; then
-  # Exactly-one present is a REFUSE (managed mode); never combine across roots.
-  if [ "$has_pair" = "0" ]; then
-    [ -f "$LEDGER" ] && die "managed mode: ledger present but plan missing (refuse; never mix roots)"
-    [ -f "$PLAN" ]  && die "managed mode: plan present but ledger missing (refuse; never mix roots)"
+# ledger + plan are a MATCHED PAIR: both present (use both), both absent (legacy
+# in auto / refuse in required), or exactly-one present (REFUSE in BOTH modes —
+# a lone file signals a half-edited deployment and must never be silently paired
+# with a repo copy of the other, which could be from a different schema generation).
+has_ledger=0; has_plan=0
+[ -f "$LEDGER" ] && has_ledger=1
+[ -f "$PLAN" ] && has_plan=1
+has_pair=0; [ "$has_ledger" = "1" ] && [ "$has_plan" = "1" ] && has_pair=1
+if [ "$has_pair" = "0" ]; then
+  if [ "$has_ledger" = "1" ] && [ "$has_plan" = "0" ]; then
+    die "ledger present but plan missing (refuse; never mix roots / pair a lone file)"
+  fi
+  if [ "$has_plan" = "1" ] && [ "$has_ledger" = "0" ]; then
+    die "plan present but ledger missing (refuse; never mix roots / pair a lone file)"
+  fi
+  # neither present.
+  if [ "$PREFLIGHT" = "required" ]; then
     die "managed mode: no planner pair at CONFIG_ROOT (need $LEDGER + $PLAN)"
   fi
-else  # auto
-  if [ "$has_pair" = "0" ]; then
-    log "auto mode: no planner pair — legacy launch (no preflight)"
-    exec "$ADAPTER" "$ROLE" "$RUNTIME_ROOT" "$PROJECT_ROOT" "$MODEL_ID" "$KIND" "$SPEC" "$SERVED"
-  fi
+  log "auto mode: no planner pair — legacy launch (no preflight)"
+  exec "$ADAPTER" "$ROLE" "$RUNTIME_ROOT" "$PROJECT_ROOT" "$MODEL_ID" "$KIND" "$SPEC" "$SERVED"
 fi
 
 [ -x "$PLANNER" ] || [ -f "$PLANNER" ] || die "planner not found: $PLANNER"
@@ -85,12 +92,12 @@ flock 9
 log "lock held"
 
 # ---- discover residents (label-based, no name inference) -------------------
-# Phase D adds io.inferencectl.managed labels; until then, fall back to counting
-# OTHER managed containers by the convention this service uses. Residents reduce
-# the GPU free the candidate sees (their peak is already consumed).
+# Residents are discovered by io.inferencectl.managed label (set by the adapter
+# on every managed launch), NOT by container name (name is mutable/operator-set;
+# the label carries the stable planner identity). Residents' peak is already
+# consumed, so they reduce the GPU free the candidate sees.
 residents_block=""
 if command -v docker >/dev/null 2>&1; then
-  # Prefer labeled discovery (Phase D); filter out the temp CUDA probe container.
   others=$(docker ps --filter "label=io.inferencectl.managed=true" \
                      --format '{{.Label "io.inferencectl.memory_profile"}}' 2>/dev/null \
            | grep -v "^${MODEL_ID}\$" || true)
@@ -100,6 +107,20 @@ if command -v docker >/dev/null 2>&1; then
 model_id = \"${prof}\"
 "
     done <<<"$others"
+  fi
+  # Unknown GPU-holding container guard (managed mode): any container using the
+  # GPU that is NOT io.inferencectl.managed (and not this short-lived probe) is
+  # an unaccounted memory consumer. In required mode, REFUSE — the plan cannot
+  # reason about unmanaged residents, and silently ignoring them is fail-open.
+  # (The CUDA probe container here is transient and does not hold a GPU lease.)
+  if [ "$PREFLIGHT" = "required" ]; then
+    # crude GPU-tenant check: containers with --gpus are not directly listable,
+    # so we rely on the managed label; an unmanaged container counts as unknown.
+    unmanaged=$( { docker ps --format '{{.Names}}\t{{.Label "io.inferencectl.managed"}}' \
+                  | awk -F'\t' '$2 != "true" {print $1}'; } 2>/dev/null || true)
+    if [ -n "$unmanaged" ]; then
+      die "managed mode: unmanaged container(s) present ($(echo $unmanaged | tr '\n' ' ')); cannot reason about unaccounted GPU memory"
+    fi
   fi
 fi
 

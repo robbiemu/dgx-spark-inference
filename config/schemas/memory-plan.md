@@ -1,9 +1,12 @@
 # Memory plan (schema notes)
 
-The memory planner (`tools/memory_planner/resolve_memory_plan.py`) is a
-**standalone consistency + planning tool**, like the capability resolver. It is
-not yet on the live launch path; the plan is for `dispatch.sh` to call it as a
-preflight (derive the two knobs, refuse on gate failure). See
+The memory planner (`tools/memory_planner/resolve_memory_plan.py`) is wired into
+the live launch path via `src/inferencectl/admission.sh` (the serialized
+admission wrapper), invoked by `dispatch.sh` when a planner pair is enrolled.
+The wrapper holds a global lock across discover → sample → resolve → launch →
+**verified allocation** (closing the preflight↔allocation race), and refuses
+(exit 75) on gate failure. The **capability** resolver (`resolve_service_plan.py`)
+remains deliberately OFF the live path (forbidden anti-pattern). See
 `docs/v0_2_phase0_results.md` for the Phase 0 measurements this is built on and
 the design rationale (why a *derived* fraction + `max_total_tokens` cap, not a
 static fraction or enumerated residency sets).
@@ -90,3 +93,53 @@ A model that fails either gate is refused **before the GPU is touched**. A faile
 slot does not reduce the running counters for subsequent slots (one bad record
 cannot cascade a false fit). The dispatcher emits, per admitted model:
 `mem_fraction_static` (derived) + `max_total_tokens` (the target cap).
+
+## Admission wrapper — `src/inferencectl/admission.sh`
+
+Enrollment (`DGX_MEMORY_PREFLIGHT`):
+- **`auto`** (default): run the preflight only if a matched planner pair exists
+  in `CONFIG_ROOT`; else legacy launch (current v0.1 behavior, unchanged).
+- **`required`**: always run; **fail-closed** — missing/mismatched pair, GPU-probe
+  failure, or an unmanaged GPU container → REFUSE (never silently downgrade to
+  legacy; `/proc/meminfo` alone cannot derive the fraction SGLang will use).
+- **`off`**: explicit manual bypass; loud warning, no resolver.
+
+**Matched-pair atomicity.** `memory_ledger.toml` + `memory_plan.toml` are a
+**pair**: both present (use both), both absent (legacy in `auto` / refuse in
+`required`), or exactly-one present (**REFUSE in both modes** — a lone file
+signals a half-edited deployment; never silently pair it with a repo copy of the
+other, which could be from a different schema generation).
+
+**Serialized admission (the race fix).** `flock` on `/run/dgx-inference-admission.lock`
+spans discover → sample → resolve → launch → **verify realized allocation via
+`/get_server_info`** (carrying the API key) → release. The adapter child is
+launched with the lock fd closed (so a long-lived adapter cannot hold the lock
+and deadlock co-residents). Two concurrent dispatchers cannot both pass while the
+first candidate is between preflight and allocation commitment. After verified
+admission, the wrapper execs into supervising the adapter (Type=simple requires
+the tracked PID to stay alive).
+
+**Refusal exit code 75** (EX_TEMPFAIL): a deliberate admission refusal. The unit's
+`StartLimitBurst=3`/`StartLimitIntervalSec=300` bounds any restart churn (no
+infinite storm); an operator who wants a 75 to be non-retryable can adjust
+`Restart=` policy (a future operator/systemd step). **Per-role fail-safe**: a
+refusal for one role never takes down a healthy co-resident.
+
+**Dispatch is the only accepted override source.** `admission.sh` clears any
+inherited `DGX_MEM_*` env before exporting the resolver-derived values, so a stale
+shell export or old systemd environment cannot bypass the budget contract.
+
+## Resident discovery — durable labels (no name inference)
+
+Co-residents are discovered by `io.inferencectl.managed=true` labels (set by the
+adapter on every managed launch), NOT by container name. Each managed container
+carries:
+- `io.inferencectl.managed=true`
+- `io.inferencectl.role=<ROLE>`
+- `io.inferencectl.memory_profile=<MODEL_ID>` (the stable planner identity)
+- `io.inferencectl.ledger_revision=<sha256[:16]>` (ties the resident to the exact
+  budget-ledger generation; empty for legacy/unmanaged launches)
+
+In `required` mode, an **unmanaged GPU-holding container** (not labeled) causes a
+REFUSE — the plan cannot reason about unaccounted memory, and silently ignoring
+it is fail-open.
