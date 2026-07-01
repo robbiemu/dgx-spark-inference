@@ -16,7 +16,7 @@
 
 A coordinated speculative-decoding bundle: the `qwen36-27b-fp8` target served by
 SGLang with a `qwen36-27b-dflash` drafter under the `DFLASH` algorithm. The
-adapter launches it via the bundle branch of `runtime/sglang/adapter.sh`. See
+adapter launches it via the bundle branch of `runtime/sglang/adapters/sglang.sh`. See
 `sglang.toml` for the coordination parameters.
 
 ## Experimental status

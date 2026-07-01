@@ -13,7 +13,7 @@ the catalog lists. See [`../../docs/architecture.md`](../../docs/architecture.md
 | `runtime-manifest.toml` | What the runtime *is*: image tag + **pinned image ID**, launch defaults, supported config kinds, known limitations. |
 | `available.toml` | The candidate catalog per role (production; DFlash is intentionally absent from `agentic`). |
 | `capability.toml` | The runtime capability record (resolver input). |
-| `adapter.sh` | The launch adapter (installed at `adapters/sglang.sh`). |
+| `adapters/sglang.sh` | The launch adapter (lives at the path the manifest declares). |
 
 ## Building the runtime image (important)
 

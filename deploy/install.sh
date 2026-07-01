@@ -100,8 +100,9 @@ install_program_tree() {
   srun install -m 0644 "$SOURCE_DIR/runtime/sglang/Dockerfile"            "$INSTALL_ROOT/runtime/sglang/Dockerfile"
   srun install -m 0644 "$SOURCE_DIR/runtime/sglang/available.toml"        "$INSTALL_ROOT/runtime/sglang/available.toml"
   srun install -m 0644 "$SOURCE_DIR/runtime/sglang/capability.toml"       "$INSTALL_ROOT/runtime/sglang/capability.toml"
-  # adapter lives at the path the manifest declares (adapters/sglang.sh).
-  srun install -m 0755 "$SOURCE_DIR/runtime/sglang/adapter.sh" "$INSTALL_ROOT/runtime/sglang/adapters/sglang.sh"
+  # adapter lives at adapters/sglang.sh in the source tree (matching the manifest's
+  # launch_adapter declaration), so install copies it in-place — no rename.
+  srun install -m 0755 "$SOURCE_DIR/runtime/sglang/adapters/sglang.sh" "$INSTALL_ROOT/runtime/sglang/adapters/sglang.sh"
   # profiles + bundles + their capability records (immutable artifacts). Copy
   # WITHOUT preserving source ownership: these install root-owned (the live
   # service must not depend on user-owned files under a root-owned path).
