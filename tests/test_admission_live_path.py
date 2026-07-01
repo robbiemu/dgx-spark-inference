@@ -99,22 +99,16 @@ def _run_dispatch(stub_dir: Path, *, preflight, admission_present, pair_state) -
     """Run the REAL dispatch.sh with stubs. pair_state: 'both'|'ledger-only'|'none'.
     admission_present controls whether the wrapper is reachable."""
     td = stub_dir
-    # Build a TEMP runtime root carrying the real available.toml + manifest (so
-    # dispatch resolution succeeds) plus a stub adapter at the manifest's expected
-    # "adapters/sglang.sh" path. (The repo source has runtime/sglang/adapter.sh,
-    # but the manifest expects adapters/sglang.sh — we don't want to pollute the
-    # repo, so we stage a temp runtime that satisfies dispatch without touching it.)
-    import shutil
-    RT = td / "rt"
-    (RT / "adapters").mkdir(parents=True, exist_ok=True)
-    shutil.copy(ROOT / "runtime" / "sglang" / "available.toml", RT / "available.toml")
-    shutil.copy(ROOT / "runtime" / "sglang" / "runtime-manifest.toml", RT / "runtime-manifest.toml")
-    _stub(RT / "adapters", "sglang.sh", "echo adapter-ran; exit 0")
+    # Use the REAL runtime root: available.toml + manifest + adapters/sglang.sh all
+    # resolve in-source now (the source path matches the manifest declaration, so
+    # dispatch resolution succeeds without staging a temp runtime). We stub only the
+    # parts past resolution (docker/curl/resolver) so we actually reach routing.
+    RT = ROOT / "runtime" / "sglang"
     (td / "inference.env").write_text(
         f'MODEL_CACHE_ROOT="{td}"\nPORT="30000"\nCONTAINER_NAME="x"\nPROJECT_ROOT="{ROOT}"\n')
     (td / "active-models.toml").write_text(
         '[active.agentic]\nmodel_id="qwen36-27b-fp8"\nruntime_id="sglang"\n')
-    # project_root = the temp runtime tree (has the staged available.toml + manifest)
+    # project_root = the real runtime tree (has available.toml + manifest + adapter)
     (td / "runtimes.toml").write_text('[runtimes.sglang]\nproject_root="%s"\n' % RT)
     for f in ("memory_ledger.toml", "memory_plan.toml"):
         (td / f).unlink(missing_ok=True)

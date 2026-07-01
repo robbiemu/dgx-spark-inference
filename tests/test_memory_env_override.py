@@ -21,7 +21,7 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-ADAPTER = ROOT / "runtime" / "sglang" / "adapter.sh"
+ADAPTER = ROOT / "runtime" / "sglang" / "adapters" / "sglang.sh"
 RUNTIME_ROOT = ROOT / "runtime" / "sglang"
 SPEC_REL = "profiles/qwen36-27b-fp8/sglang.toml"
 
