@@ -1,17 +1,11 @@
 # dgx-spark-inference
 
-> `dgx-spark-inference` is a reference implementation for operating one
-> authenticated, swappable SGLang model slot on a single NVIDIA DGX Spark. It
-> provides reproducible runtime and model profiles, explicit compatibility
-> contracts, a systemd-managed endpoint, and operator-controlled cold swaps.
-> **It is not a multi-tenant serving platform or an Ollama-style request-driven
-> model loader.**
+> `dgx-spark-inference` runs a small set of authenticated SGLang services on one NVIDIA DGX Spark. It keeps runtime and model profiles pinned, binds models to named roles, and manages their endpoints with systemd.
 
+Services can share the machine when their recorded memory budgets fit. Before each launch, the dispatcher measures available memory, derives SGLang’s static-memory setting, caps the KV pool, and checks host-memory headroom. When a role cannot meet its budget, that role is refused and services already running are left alone.
 
-The topology is opinionated by its constraints: one GB10, one client,
-operator-driven swaps, systemd. Multiple roles are out of scope for v0.1; the
-release ships only the **`agentic`** role (coding/general agent work), served as
-`qwen3.6-27b-agentic`. This is a reference implementation, not a generic platform.
+The intended topology is a fixed local setup: a few named roles, locally managed endpoints, and deliberate operator changes. The current work is grounded in a long-context primary model running alongside a smaller helper service.
+
 
 <img width="100%" alt="ChatGPT Image 30 de jun  de 2026, 14_12_19" src="https://github.com/user-attachments/assets/4de0716b-1b83-4d32-8f0e-a49b2e91950e" />
 
@@ -33,8 +27,7 @@ The measurements and behavior in this repo were validated on this configuration
 
 ## What's in the box
 
-- A **single launch path**: `systemd → dispatch.sh → sglang adapter`. Exactly one;
-  there is no alternate launcher.
+- One managed launch path per role: `systemd → dispatch.sh → admission.sh → sglang adapter`. Admission serializes launches, applies the memory budget for the candidate role, and verifies the realized KV-pool capacity after startup.
 - **Reproducible profiles** that *describe* a model (HF repo + pinned revision +
   quantization + launch params). **No model weights are redistributed** — fetch
   them with `hf` (the Hugging Face CLI; documented per profile).
