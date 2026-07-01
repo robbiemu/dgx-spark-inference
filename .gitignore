@@ -1,0 +1,4 @@
+
+# Python bytecode / caches (never commit)
+__pycache__/
+*.pyc

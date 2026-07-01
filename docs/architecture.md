@@ -63,6 +63,21 @@ dispatcher exists, why the in-container `--host 127.0.0.1` breaks Docker
    (image-id pin, api-key shape check), renders the runtime YAML (mode 0600), and
    launches the container.
 
+### v0.2 — memory preflight + serialized admission (when enrolled)
+
+When a planner pair (`memory_ledger.toml` + `memory_plan.toml`) is enrolled in
+`CONFIG_ROOT`, `dispatch.sh` execs **`src/inferencectl/admission.sh`** instead of
+the adapter directly (legacy single-role launches with no pair are unchanged).
+The admission wrapper holds a global `flock` across: discover residents (by
+`io.inferencectl.managed` label) → sample GPU/Linux free memory → derive
+`mem_fraction_static` + `max_total_tokens` via `tools/memory_planner/` → launch
+the adapter as a child → **verify realized allocation** via `/get_server_info` →
+release the lock → supervise the child. This closes the preflight↔allocation
+race (two concurrent dispatchers cannot both pass on the same free-memory
+snapshot). Refusals exit 75. See `config/schemas/memory-plan.md`. **Only the
+memory resolver is on the live path** — the capability resolver remains a
+test-time consistency tool, never invoked at launch.
+
 ### Weight resolution + the HF cache mount (design note)
 
 Profiles describe a model but never contain weights. At launch the adapter
