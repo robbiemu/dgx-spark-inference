@@ -231,125 +231,335 @@ These two files come as a pair — they describe the same host and the same meas
 
 ```mermaid
 flowchart LR
-    P[Choose model profile] --> C[Record capability evidence]
-    C --> B[Measure memory budget]
+    R[Define role contract] --> P[Choose candidate model profile]
+    P --> E[Record capability evidence]
+    E --> V[Prove candidate satisfies role]
+    V --> B[Measure memory budget]
     B --> U[Add systemd unit + endpoint]
-    U --> L[Add ledger entry]
+    U --> L[Add ledger entry + host memory plan]
     L --> T[Run no-GPU gate tests]
     T --> G[Run GPU admission + service tests]
 ```
 
-To promote a new role, you'll want:
+To add another role to an existing deployment, you need:
 
-1. A pinned model profile.
-2. Evidence the model can actually do the work you're giving it.
-3. A measured memory budget.
-4. Its own unit, endpoint, secret path, and port.
-5. An update to the memory plan for the host topology.
-6. Confirmation on the Spark that it admits cleanly and realizes its expected pool.
+1. **A role contract.** Define the role’s name, required capabilities, and residency policy. This answers what work the role is allowed to perform, independently of any particular model.
 
-For a single role, none of this is required. But it matters once you're running more than one.
+2. **A pinned candidate model profile.** Record the model identity, revision, quantization, and launch settings.
+
+3. **Evidence that the candidate satisfies the role contract.** Measure and record the capabilities the model actually provides, then prove that they cover every capability required by the role. Add the candidate to the runtime catalog only after that proof passes.
+
+4. **A measured memory budget.** Record the model’s weights, static overhead, request workspace, and admissible KV-pool range on the target hardware.
+
+5. **Its own service surface.** Add a unit, endpoint, secret path, port, and container name for the new role.
+
+6. **A host topology update.** Add the profile to the memory ledger and declare the intended resident and admissible roles in the host memory plan.
+
+7. **Live verification on the Spark.** Confirm that the new role admits cleanly beside the existing service, realizes its expected KV pool, and refuses safely without disturbing healthy residents when the topology cannot fit.
+
+The shipped single-role `agentic` setup already has a role contract, pinned profile, compatible catalog entry, unit, endpoint, and baseline launch settings. It does not need a co-residency memory plan.
+
+Adding `agentic-helper` changes two things at once: it introduces a new semantic contract for a second role, and it introduces a shared-memory deployment topology. Both must be declared and verified.
 
 ---
 
 ### Worked example: adding the Ornith-9B helper
 
-A concrete walkthrough of going from one role to two — a cheap/fast
-`agentic-helper` served by `Ornith-1.0-9B` (FP8) alongside the Qwen primary.
-Every number was measured on a Spark (`docs/v0_2_phase0_results.md`); substitute
-your own when you reproduce.
+This walkthrough promotes a second, explicit role beside the Qwen primary: a smaller `agentic-helper` served by hydrated `Ornith-1.0-9B-FP8-DYNAMIC`.
 
-The checked-in deployment is single-role: `install.sh` declares a fixed
-one-role/one-unit scope and ships one `inference-agentic.service.in` template.
-So below, the helper's profile, role binding, unit, and plan are **local files
-you add by hand** — there is no multi-role installer path yet. Treat this as
-"here is what changed on the machine," run as the operator, on the Spark.
+A role name is not a capability contract. `agentic-helper` means nothing to the resolver, catalog, or client until its requirements are written down. In this example, the helper is intended for tool-using, multi-turn agent work that may need reasoning and grammar-constrained structured output. Its role contract therefore requires all five capabilities:
 
-```bash
-# 1. Verify the existing primary is healthy before changing anything.
-INFCTL=/usr/local/lib/dgx-spark-inference/src/inferencectl/inference-cli.sh
-sudo CONFIG_ROOT=/etc/dgx-spark-inference "$INFCTL" status
-curl -s -o /dev/null -w "primary /health = %{http_code}\n" http://127.0.0.1:30000/health   # 200
+* `chat_completion`
+* `reasoning`
+* `tool_calling`
+* `multiturn_continuity`
+* `structured_output`
+
+The promotion sequence is deliberate:
+
+```text
+role contract
+  → measured model capability record
+  → resolver proof
+  → runtime catalog entry
+  → systemd endpoint
+  → memory-admission plan
+  → live health and pool verification
 ```
 
+Do not reverse that order. A profile saying “helper” does not establish what a helper is allowed to do.
+
+The checked-in installer is still single-role: it ships one `agentic` unit and does not create a second role’s policy, profile, catalog entry, or unit. Treat the version-controlled role policy, capability record, catalog entry, and tests as project changes. Treat the unit, secrets, and memory-plan files as host-specific operator state.
+
+#### 1. Verify the primary before changing anything
+
 ```bash
-# 2. Create the hydrated Ornith bundle and hash it.
-#    The FP8 derivative (barryke/Ornith-1.0-9B-FP8-DYNAMIC) omits two processor
-#    configs that Ornith's processor stack needs even for text-only serving.
-#    Copy them from the BF16 base (vision_config is byte-identical -> compatible)
-#    and record a manifest. Do NOT source missing files at runtime (Frankenstein).
-BUNDLE=$MODEL_CACHE_ROOT/ornith-1.0-9b-fp8
-hf download barryke/Ornith-1.0-9B-FP8-DYNAMIC --local-dir "$BUNDLE"
+INFCTL=/usr/local/lib/dgx-spark-inference/src/inferencectl/inference-cli.sh
+
+sudo CONFIG_ROOT=/etc/dgx-spark-inference "$INFCTL" status
+
+curl -s -o /dev/null -w "primary /health = %{http_code}\n" \
+  http://127.0.0.1:30000/health
+# expected: 200
+```
+
+The existing primary must be healthy before the helper is introduced. The helper promotion must not become a repair session for an already-unhealthy primary.
+
+#### 2. Build the complete hydrated Ornith artifact
+
+The FP8 derivative omits processor files required by Ornith’s conditional multimodal wrapper, even for text-only serving. Build one complete local artifact and record exactly what it contains. Do not source missing files dynamically at launch.
+
+```bash
+BUNDLE="$MODEL_CACHE_ROOT/ornith-1.0-9b-fp8"
+
+hf download barryke/Ornith-1.0-9B-FP8-DYNAMIC \
+  --local-dir "$BUNDLE"
+
 hf download deepreinforce-ai/Ornith-1.0-9B \
   --include preprocessor_config.json video_preprocessor_config.json \
   --local-dir /tmp/ornith-bf16-base
-cp /tmp/ornith-bf16-base/{preprocessor_config,video_preprocessor_config}.json "$BUNDLE/"
-( cd "$BUNDLE" && sha256sum * | tee HYDRATION_MANIFEST.md )
+
+cp /tmp/ornith-bf16-base/{preprocessor_config,video_preprocessor_config}.json \
+  "$BUNDLE/"
+
+(
+  cd "$BUNDLE"
+  sha256sum * | tee HYDRATION_MANIFEST.md
+)
 ```
 
-```bash
-# 3. Add the local profile, role binding, and helper unit (operator-written files;
-#    install.sh does not create these — it is single-role).
-#    - profiles/ornith-1.0-9b-fp8/{sglang.toml,capability.toml}: identity/revision
-#      + the helper's measured capability contract (chat/reasoning/tool/structured).
-#    - a role binding: append [roles.agentic-helper] to runtime/sglang/available.toml
-#      with served_model_name = "agentic-helper" and the candidate pointing at the profile.
-#    - /etc/systemd/system/inference-agentic-helper.service: hand-adapt the shipped
-#      inference-agentic.service.in — ROLE=agentic-helper, port 30001, container
-#      inference-agentic-helper. (There is no template-installer; you resolve the
-#      placeholders yourself.)
+The resulting local directory is the artifact the profile describes. Record the FP8 source revision, the BF16 source revision for the copied files, and the hydration manifest in that profile’s provenance.
+
+#### 3. Define `agentic-helper` before choosing it
+
+Extend the project role policy in `config/examples/roles.toml`. This file is the source of truth for what a role requires. Keep the existing primary contract and add the helper explicitly.
+
+```toml
+# config/examples/roles.toml
+
+requested_roles = ["agentic", "agentic-helper"]
+
+[roles.agentic]
+required_model_capabilities = [
+  "chat_completion",
+  "tool_calling",
+  "structured_output",
+]
+
+[roles.agentic.residency]
+default_up = true
+idle_timeout_sec = 900
+idle_floor_sec = 300
+idle_behavior = "stay_up"
+
+# This role is not shorthand for “a small model.”
+# It is a tool-using, multi-turn helper with a measured reasoning and
+# grammar-constrained-output requirement.
+[roles.agentic-helper]
+required_model_capabilities = [
+  "chat_completion",
+  "reasoning",
+  "tool_calling",
+  "multiturn_continuity",
+  "structured_output",
+]
+
+[roles.agentic-helper.residency]
+# Keep first promotion operator-controlled. Enable automatic startup only
+# after the two-role deployment has passed its live verification.
+default_up = false
+idle_timeout_sec = 900
+idle_floor_sec = 300
+idle_behavior = "stay_up"
 ```
 
-```bash
-# 4. Drop the matched ledger/plan pair into CONFIG_ROOT and enable required preflight.
-#    These come as a PAIR (atomic); exactly-one present is a refuse, never mix roots.
-cp tools/memory_planner/budget_ledger.toml /etc/dgx-spark-inference/memory_ledger.toml
-#    write /etc/dgx-spark-inference/memory_plan.toml for THIS host's residency:
-#      device.total_gib, [policy] memavailable_floor_gib, [[resident]] = primary,
-#      [[admit]] role=agentic-helper model_id=ornith-1.0-9b-fp8
-#      (see tools/memory_planner/plan_coresident.toml)
-#    then edit the helper unit to set: Environment=DGX_MEMORY_PREFLIGHT=required
+This makes the distinction concrete:
+
+* `agentic` is the primary role’s current minimum contract.
+* `agentic-helper` is a separate role with its own purpose and stricter declared requirements.
+* The helper cannot be cataloged merely because Ornith launches or emits plausible chat text.
+
+#### 4. Create Ornith’s capability record
+
+Create `profiles/ornith-1.0-9b-fp8/capability.toml` beside the helper’s SGLang launch profile.
+
+The ordinary identity and provenance fields must name the hydrated artifact you actually built. The role-relevant portion must be exactly this:
+
+```toml
+kind = "model-capability"
+capability_id = "ornith-1.0-9b-fp8-agentic-helper"
+promotion_state = "approved"
+approval_scope = "spark-coresident-reference-v0.2"
+
+model_id = "ornith-1.0-9b-fp8"
+source_repository = "barryke/Ornith-1.0-9B-FP8-DYNAMIC"
+source_revision = "<pinned FP8 revision>"
+quantization = "fp8"
+
+# This candidate offers itself only for the role it was measured to fill.
+roles = ["agentic-helper"]
+
+capabilities = [
+  "chat_completion",
+  "reasoning",
+  "tool_calling",
+  "multiturn_continuity",
+  "structured_output",
+]
+
+compatible_runtime_ids = [
+  "sglang-v0.5.14-cu130-runtime-distro1.9.0",
+]
+
+launch_profile = "ornith-1.0-9b-fp8-agentic-helper"
 ```
 
+Do not copy this approval state to another Ornith revision, quantization, runtime image, parser configuration, or hydration recipe without re-running the gates.
+
+For this particular candidate, the evidence must cover:
+
+1. Chat completion with reasoning separated from visible content.
+2. Tool-call parsing using the configured tool-call parser.
+3. Multi-turn continuity through a tool result.
+4. Grammar-constrained structured output, not prompt-only JSON.
+5. The reasoning-token budget needed for constrained requests.
+
+The observed structured-output condition is operationally important: the helper may consume hundreds of tokens in reasoning before emitting its constrained answer. Document a client minimum such as `max_tokens >= 600` for constrained requests, based on the measured result.
+
+#### 5. Prove the role resolves before offering it to the runtime
+
+The resolver is a consistency gate, not a launch-time gate. Run it before editing `available.toml` or starting a helper service.
+
+Because the resolver expects directories containing only capability records, stage the two model records and the runtime record into temporary directories:
+
 ```bash
-# 5. Reload systemd, start the helper, and inspect health + logs + realized pool.
+MODEL_CAPS="$(mktemp -d)"
+RUNTIME_CAPS="$(mktemp -d)"
+
+cp profiles/qwen36-27b-fp8/capability.toml \
+  "$MODEL_CAPS/qwen36-27b-fp8.toml"
+
+cp profiles/ornith-1.0-9b-fp8/capability.toml \
+  "$MODEL_CAPS/ornith-1.0-9b-fp8.toml"
+
+cp runtime/sglang/capability.toml \
+  "$RUNTIME_CAPS/sglang.toml"
+
+python3 tools/resolve_service_plan.py \
+  --request config/examples/roles.toml \
+  --models-dir "$MODEL_CAPS" \
+  --runtimes-dir "$RUNTIME_CAPS"
+```
+
+The command must exit successfully and report both `agentic` and `agentic-helper` as resolved.
+
+Also add a repository test that fails if Ornith no longer resolves for `agentic-helper`, and extend the catalog-compatibility test so adding an incompatible candidate later cannot silently bypass the role contract.
+
+A resolver failure is a stop sign. Fix the role definition, capability record, evidence, or runtime compatibility. Do not continue by weakening the catalog.
+
+#### 6. Offer only the proven candidate in the runtime catalog
+
+After the resolver and tests pass, append the helper slot to `runtime/sglang/available.toml`:
+
+```toml
+[roles.agentic-helper]
+default = "ornith-1.0-9b-fp8"
+served_model_name = "agentic-helper"
+
+[[roles.agentic-helper.models]]
+id = "ornith-1.0-9b-fp8"
+kind = "model"
+spec = "profiles/ornith-1.0-9b-fp8/sglang.toml"
+```
+
+This catalog entry does not define the role’s requirements. It only says that this already-proven candidate is available to fill that role.
+
+The stable served name belongs to the role slot, not the underlying model. Future compatible helper swaps preserve the API name `agentic-helper`.
+
+#### 7. Add the second systemd service and endpoint
+
+Create `/etc/systemd/system/inference-agentic-helper.service` by copying the shipped agentic unit and changing the role-specific values:
+
+```text
+ROLE=agentic-helper
+PORT=30001
+CONTAINER_NAME=inference-agentic-helper
+DGX_MEMORY_PREFLIGHT=required
+```
+
+Keep the helper’s API key path distinct from the primary if the two roles have different clients or trust boundaries. The helper must not reuse a throwaway probe container, port, or probe-only secret.
+
+Reload the unit definitions after creating the helper unit:
+
+```bash
 sudo systemctl daemon-reload
-sudo systemctl start inference-agentic-helper.service
-# cold load ~80s for the 9B; readiness is /health=200 (poll, don't trust the fast return).
-curl -s -o /dev/null -w "helper /health = %{http_code}\n" http://127.0.0.1:30001/health
-curl -s -o /dev/null -w "primary /health = %{http_code}\n" http://127.0.0.1:30000/health  # still 200
-sudo journalctl -u inference-agentic-helper.service -n 40 --no-pager
-# Confirm the realized pool is within the helper's contract band [min, cap]:
-KEY=$(sudo grep SGLANG_API_KEY /etc/dgx-spark-inference/agent.env | cut -d= -f2)
-curl -s -H "Authorization: Bearer $KEY" http://127.0.0.1:30001/get_server_info \
-  | jq '.max_total_num_tokens'   # expect within [32768, 376048]
 ```
+
+#### 8. Add the helper to the memory-admission topology
+
+Install the ledger and plan as a matched pair:
 
 ```bash
-# 6. See what a refusal looks like — and that the primary stays up.
-#    Temporarily set the floor above what co-residency leaves (e.g. 50 GiB) in
-#    memory_plan.toml, restart the helper, and watch it refuse (exit 75):
-sudo systemctl restart inference-agentic-helper.service
-sudo journalctl -u inference-agentic-helper.service -n 15 --no-pager | grep -i refuse
-curl -s -o /dev/null -w "primary still /health = %{http_code}\n" http://127.0.0.1:30000/health
-#    then restore the real floor and restart.
+sudo cp tools/memory_planner/budget_ledger.toml \
+  /etc/dgx-spark-inference/memory_ledger.toml
 ```
 
-> **Capability caveat for the helper contract.** Ornith-9B FP8 passed all four
-> helper gates (reasoning in its own field, tool-call parse via `qwen3_coder`,
-> multi-turn continuity, grammar-constrained `structured_output`). One
-> operational note: a constrained request needs generous `max_tokens` — Ornith
-> reasons heavily before emitting, and a low cap returns empty content (the same
-> budget lesson as the primary's long thinking traces). Record only what you
-> measured in `capability.toml`.
+Write `/etc/dgx-spark-inference/memory_plan.toml` for this host’s intended residency. It must include the primary as a resident and the helper as an admissible role:
 
-> **Why a derived fraction, not a static one.** The same `mem_fraction_static`
-> reserves wildly different absolute pools depending on what's already resident
-> (proven the hard way: a static `0.80` helper fraction loaded *solo* against
-> ~124 GiB free reserved ~99 GiB and starved the primary). The planner derives
-> the fraction from the *measured* free GPU memory at launch (not the device
-> total) and pins the pool with a `max_total_tokens` cap, which makes the helper
-> safe to load in either order.
+```toml
+[[resident]]
+role = "agentic"
+model_id = "qwen36-27b-fp8"
+
+[[admit]]
+role = "agentic-helper"
+model_id = "ornith-1.0-9b-fp8"
+```
+
+Use the measured helper budget and host floor for this machine. Do not transplant a static `mem_fraction_static` from an earlier probe. Admission derives the fraction from current free memory and caps the pool with `max_total_tokens`.
+
+#### 9. Start, verify, and inspect the helper
+
+```bash
+sudo systemctl start inference-agentic-helper.service
+
+curl -s -o /dev/null -w "helper /health = %{http_code}\n" \
+  http://127.0.0.1:30001/health
+
+curl -s -o /dev/null -w "primary /health = %{http_code}\n" \
+  http://127.0.0.1:30000/health
+
+sudo journalctl -u inference-agentic-helper.service -n 40 --no-pager
+```
+
+The helper is ready only when its `/health` endpoint returns `200`. A fast return from `systemctl start` is not readiness.
+
+Then confirm that the authenticated server reports a token pool within the helper’s declared admissible range:
+
+```bash
+KEY="$(
+  sudo awk -F= '
+    $1 == "SGLANG_API_KEY" {
+      print $2
+      exit
+    }
+  ' /etc/dgx-spark-inference/agent.env
+)"
+
+curl -s \
+  -H "Authorization: Bearer $KEY" \
+  http://127.0.0.1:30001/get_server_info \
+  | jq '.max_total_num_tokens'
+```
+
+Finally, perform a deliberate refusal test by setting the host-memory floor above the available co-resident headroom, restarting only the helper, and confirming:
+
+* the helper exits with admission refusal,
+* the primary remains healthy on port `30000`,
+* restoring the real plan allows the helper to start again.
+
+That final refusal test is part of promoting the role. A two-service setup is not complete merely because both models happened to coexist once.
+
 
 ## Install the service
 
