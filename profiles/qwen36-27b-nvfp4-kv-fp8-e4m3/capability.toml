@@ -1,0 +1,18 @@
+kind = "model-capability"
+capability_id = "qwen36-27b-nvfp4-kv-fp8-e4m3-agentic-candidate"
+promotion_state = "approved"
+approval_scope = "local-dgx-spark-2026-07-03"
+model_id = "qwen36-27b-nvfp4-kv-fp8-e4m3"
+source_repository = "nvidia/Qwen3.6-27B-NVFP4"
+source_revision = "0893e1606ff3d5f97a441f405d5fc541a6bdf404"
+quantization = "nvfp4"
+roles = ["agentic"]
+capabilities = [
+  "chat_completion",
+  "structured_output",
+  "tool_calling",
+]
+compatible_runtime_ids = [
+  "sglang-v0.5.14-cu130-nvfp4fix1",
+]
+launch_profile = "qwen36-27b-nvfp4-kv-fp8-e4m3-autoregressive"

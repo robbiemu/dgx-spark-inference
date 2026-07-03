@@ -6,3 +6,7 @@
 [active.agentic]
 model_id   = "qwen36-27b-fp8"                   # must be in available.toml[agentic].models[].id
 runtime_id = "sglang-v0.5.14-cu130-runtime-distro1.9.0"
+
+[active.agentic-helper]
+model_id   = "ornith-1.0-9b-fp8"
+runtime_id = "sglang-v0.5.14-cu130-nvfp4fix1"

@@ -1,0 +1,26 @@
+[Unit]
+Description=DGX Spark Ornith agentic helper
+Wants=network-online.target
+After=network-online.target docker.service dgx-spark-inference.service
+Requires=docker.service
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+EnvironmentFile=__CONFIG_ROOT__/agent.env
+Environment=CONFIG_ROOT=__CONFIG_ROOT__
+Environment=PORT=30001
+Environment=CONTAINER_NAME=inference-agentic-helper
+ExecStartPre=__PROGRAM_ROOT__/tools/wait_for_health.sh http://127.0.0.1:30000/health 600
+ExecStartPre=-/usr/bin/docker rm --force inference-agentic-helper
+ExecStart=__INSTALL_ROOT__/dispatch.sh agentic-helper
+ExecStop=/usr/bin/docker stop --timeout 45 inference-agentic-helper
+ExecStopPost=/usr/bin/rm -f /run/inference-agentic-helper/sglang.yaml
+Restart=always
+RestartSec=15
+TimeoutStartSec=infinity
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

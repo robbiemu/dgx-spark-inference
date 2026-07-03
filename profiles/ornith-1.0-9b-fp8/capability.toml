@@ -1,0 +1,19 @@
+kind = "model-capability"
+capability_id = "ornith-1.0-9b-fp8-agentic-helper"
+promotion_state = "approved"
+approval_scope = "spark-coresident-reference-v0.2"
+model_id = "ornith-1.0-9b-fp8"
+source_repository = "barryke/Ornith-1.0-9B-FP8-DYNAMIC"
+source_revision = "01272cd6c8228e82897c08826ef83c86b3787a0d"
+quantization = "fp8"
+roles = ["agentic-helper"]
+capabilities = [
+  "chat_completion",
+  "reasoning",
+  "tool_calling",
+  "multiturn_continuity",
+  "structured_output",
+]
+compatible_runtime_ids = ["sglang-v0.5.14-cu130-nvfp4fix1"]
+launch_profile = "ornith-1.0-9b-fp8-agentic-helper"
+evidence = "evidence/2026-06-30.md"

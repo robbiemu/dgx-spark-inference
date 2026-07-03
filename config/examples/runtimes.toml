@@ -9,3 +9,6 @@
 # not a Git checkout. The live service must not depend on a mutable checkout.
 [runtimes.sglang-v0.5.14-cu130-runtime-distro1.9.0]
 project_root = "/usr/local/lib/dgx-spark-inference/runtime/sglang"
+
+[runtimes.sglang-v0.5.14-cu130-nvfp4fix1]
+project_root = "/usr/local/lib/dgx-spark-inference/runtime/sglang-nvfp4fix"

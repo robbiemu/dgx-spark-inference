@@ -91,11 +91,19 @@ OPERATOR_STATE=(active-models.toml runtimes.toml)
 install_program_tree() {
   srun install -d -m 0755 "$INSTALL_ROOT"
   srun install -d -m 0755 "$INSTALL_ROOT/src/inferencectl" \
-                  "$INSTALL_ROOT/tools" "$INSTALL_ROOT/runtime/sglang/adapters" \
+                  "$INSTALL_ROOT/tools" "$INSTALL_ROOT/tools/memory_planner" \
+                  "$INSTALL_ROOT/runtime/sglang/adapters" \
+                  "$INSTALL_ROOT/runtime/sglang-nvfp4fix/adapters" \
                   "$INSTALL_ROOT/experiments/dflash"
   srun install -m 0755 "$SOURCE_DIR/src/inferencectl/dispatch.sh"        "$INSTALL_ROOT/src/inferencectl/dispatch.sh"
   srun install -m 0755 "$SOURCE_DIR/src/inferencectl/inference-cli.sh"   "$INSTALL_ROOT/src/inferencectl/inference-cli.sh"
+  srun install -m 0755 "$SOURCE_DIR/src/inferencectl/admission.sh"       "$INSTALL_ROOT/src/inferencectl/admission.sh"
   srun install -m 0755 "$SOURCE_DIR/tools/resolve_service_plan.py"       "$INSTALL_ROOT/tools/resolve_service_plan.py"
+  srun install -m 0755 "$SOURCE_DIR/tools/bind_active_runtime.py"        "$INSTALL_ROOT/tools/bind_active_runtime.py"
+  srun install -m 0755 "$SOURCE_DIR/tools/validate_agentic_endpoint.py"  "$INSTALL_ROOT/tools/validate_agentic_endpoint.py"
+  srun install -m 0755 "$SOURCE_DIR/tools/wait_for_health.sh"            "$INSTALL_ROOT/tools/wait_for_health.sh"
+  srun install -m 0755 "$SOURCE_DIR/tools/memory_planner/resolve_memory_plan.py" \
+                       "$INSTALL_ROOT/tools/memory_planner/resolve_memory_plan.py"
   srun install -m 0644 "$SOURCE_DIR/runtime/sglang/runtime-manifest.toml" "$INSTALL_ROOT/runtime/sglang/runtime-manifest.toml"
   srun install -m 0644 "$SOURCE_DIR/runtime/sglang/Dockerfile"            "$INSTALL_ROOT/runtime/sglang/Dockerfile"
   srun install -m 0644 "$SOURCE_DIR/runtime/sglang/available.toml"        "$INSTALL_ROOT/runtime/sglang/available.toml"
@@ -103,6 +111,12 @@ install_program_tree() {
   # adapter lives at adapters/sglang.sh in the source tree (matching the manifest's
   # launch_adapter declaration), so install copies it in-place — no rename.
   srun install -m 0755 "$SOURCE_DIR/runtime/sglang/adapters/sglang.sh" "$INSTALL_ROOT/runtime/sglang/adapters/sglang.sh"
+  srun install -m 0644 "$SOURCE_DIR/runtime/sglang-nvfp4fix/runtime-manifest.toml" "$INSTALL_ROOT/runtime/sglang-nvfp4fix/runtime-manifest.toml"
+  srun install -m 0644 "$SOURCE_DIR/runtime/sglang-nvfp4fix/Dockerfile.overlay"     "$INSTALL_ROOT/runtime/sglang-nvfp4fix/Dockerfile.overlay"
+  srun install -m 0644 "$SOURCE_DIR/runtime/sglang-nvfp4fix/README.md"              "$INSTALL_ROOT/runtime/sglang-nvfp4fix/README.md"
+  srun install -m 0644 "$SOURCE_DIR/runtime/sglang-nvfp4fix/available.toml"        "$INSTALL_ROOT/runtime/sglang-nvfp4fix/available.toml"
+  srun install -m 0644 "$SOURCE_DIR/runtime/sglang-nvfp4fix/capability.toml"       "$INSTALL_ROOT/runtime/sglang-nvfp4fix/capability.toml"
+  srun install -m 0755 "$SOURCE_DIR/runtime/sglang-nvfp4fix/adapters/sglang.sh"    "$INSTALL_ROOT/runtime/sglang-nvfp4fix/adapters/sglang.sh"
   # profiles + bundles + their capability records (immutable artifacts). Copy
   # WITHOUT preserving source ownership: these install root-owned (the live
   # service must not depend on user-owned files under a root-owned path).
@@ -132,6 +146,9 @@ render_runtimes() {
 # INSTALL_ROOT, not a Git checkout. See docs/architecture.md.
 [runtimes.sglang-v0.5.14-cu130-runtime-distro1.9.0]
 project_root = "$INSTALL_ROOT/runtime/sglang"
+
+[runtimes.sglang-v0.5.14-cu130-nvfp4fix1]
+project_root = "$INSTALL_ROOT/runtime/sglang-nvfp4fix"
 EOF
 }
 
@@ -230,6 +247,12 @@ fi
 # render + install the unit (PROGRAM target — --replace covers it).
 render_unit < "$SOURCE_DIR/deploy/systemd/inference-agentic.service.in" \
   | srun install -o root -g root -m 0644 /dev/stdin "/etc/systemd/system/$UNIT_NAME"
+sed -e "s|__CONFIG_ROOT__|$CONFIG_ROOT|g" \
+    -e "s|__INSTALL_ROOT__|$INSTALL_ROOT/src/inferencectl|g" \
+    -e "s|__PROGRAM_ROOT__|$INSTALL_ROOT|g" \
+    "$SOURCE_DIR/deploy/systemd/inference-agentic-helper.service.in" \
+  | srun install -o root -g root -m 0644 /dev/stdin \
+      "/etc/systemd/system/inference-agentic-helper.service"
 srun systemctl daemon-reload
 srun systemctl enable "$UNIT_NAME"
 
@@ -240,4 +263,6 @@ Start it as a separate reviewed operation:
   sudo systemctl start $UNIT_NAME
 Then verify health: curl -s http://127.0.0.1:$PORT/health  (expect 200)
 See docs/smoke-test.md (read-only gate) and SECURITY.md (firewall prerequisite).
+The optional helper unit was installed but not enabled or started:
+  inference-agentic-helper.service
 EOF

@@ -1,0 +1,17 @@
+[roles.agentic]
+default = "qwen36-27b-nvfp4-kv-fp8-e4m3"
+served_model_name = "qwen3.6-27b-agentic"
+
+[[roles.agentic.models]]
+id = "qwen36-27b-nvfp4-kv-fp8-e4m3"
+kind = "model"
+spec = "profiles/qwen36-27b-nvfp4-kv-fp8-e4m3/sglang.toml"
+
+[roles.agentic-helper]
+default = "ornith-1.0-9b-fp8"
+served_model_name = "agentic-helper"
+
+[[roles.agentic-helper.models]]
+id = "ornith-1.0-9b-fp8"
+kind = "model"
+spec = "profiles/ornith-1.0-9b-fp8/sglang.toml"

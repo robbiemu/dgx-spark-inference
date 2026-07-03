@@ -1,0 +1,9 @@
+FROM local/sglang-runtime:v0.5.14-cu130-runtime-distro1.9.0
+
+# Build from an SGLang v0.5.14 source checkout containing the reviewed NVFP4
+# backport. The build context is the SGLang checkout, not this repository.
+COPY python/sglang/srt/configs/model_config.py /sgl-workspace/sglang/python/sglang/srt/configs/model_config.py
+COPY python/sglang/srt/models/qwen3_5.py /sgl-workspace/sglang/python/sglang/srt/models/qwen3_5.py
+COPY python/sglang/srt/layers/quantization/modelopt_quant.py /sgl-workspace/sglang/python/sglang/srt/layers/quantization/modelopt_quant.py
+COPY python/sglang/srt/layers/vocab_parallel_embedding.py /sgl-workspace/sglang/python/sglang/srt/layers/vocab_parallel_embedding.py
+COPY python/sglang/srt/layers/logits_processor.py /sgl-workspace/sglang/python/sglang/srt/layers/logits_processor.py

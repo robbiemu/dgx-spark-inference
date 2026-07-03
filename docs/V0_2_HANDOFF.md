@@ -1,9 +1,8 @@
 # v0.2 Handoff — multi-role + the cheap/fast helper role
 
-> **Access:** `ssh robbie@spark-885a.local` as user `robbie`. Privileged operations
-> (systemctl stop/start, writing `/etc`, reading `/etc/inference-agentic/agent.env`)
-> require `robbie`'s sudo password, entered interactively — the agent cannot supply it.
-> Passwordless sudo is intentionally NOT configured (operator decision).
+> **Access:** Hostnames and operator accounts are deployment-specific and are not
+> stored in this repository. Privileged operations require an operator to enter
+> credentials interactively. Passwordless sudo is intentionally not assumed.
 
 **Purpose.** Add a second role — a cheap/fast coding-and-tool helper (`agentic-helper`)
 — alongside the strict `agentic` primary, served by `Ornith-1.0-9B` (BF16). **This

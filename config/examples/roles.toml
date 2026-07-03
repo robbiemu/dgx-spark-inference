@@ -3,7 +3,7 @@
 # candidate must provide ALL required capabilities to be resolvable for a role
 # (see tools/resolve_service_plan.py). For v0.1 only the `agentic` role ships.
 # See docs/architecture.md and config/schemas/capability-records.md.
-requested_roles = ["agentic"]
+requested_roles = ["agentic", "agentic-helper"]
 
 [roles.agentic]
 required_model_capabilities = [
@@ -20,3 +20,18 @@ default_up        = true        # role's active candidate loads at service start
 idle_timeout_sec  = 900         # adaptive idle timer start: 15 min
 idle_floor_sec    = 300         # never adapts below 5 min
 idle_behavior     = "stay_up"   # "stay_up" (home; no auto-evict) | "unload"
+
+[roles.agentic-helper]
+required_model_capabilities = [
+  "chat_completion",
+  "reasoning",
+  "tool_calling",
+  "multiturn_continuity",
+  "structured_output",
+]
+
+[roles.agentic-helper.residency]
+default_up        = false
+idle_timeout_sec  = 900
+idle_floor_sec    = 300
+idle_behavior     = "stay_up"
