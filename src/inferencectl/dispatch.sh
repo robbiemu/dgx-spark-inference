@@ -18,12 +18,22 @@
 #   dispatch.sh <ROLE>
 set -Eeuo pipefail
 
-ROLE="${1:?usage: dispatch.sh <role>}"
+REQUESTED_ROLE="${1:?usage: dispatch.sh <role>}"
+CALLER_PORT="${PORT:-}"
+CALLER_CONTAINER_NAME="${CONTAINER_NAME:-}"
 
 # Operator configuration discovery (single mechanism).
 CONFIG_ROOT="${CONFIG_ROOT:-/etc/dgx-spark-inference}"
 # shellcheck disable=SC1090,SC1091
 [ -f "$CONFIG_ROOT/inference.env" ] && . "$CONFIG_ROOT/inference.env"
+
+# Per-unit identity wins over the shared primary defaults in inference.env.
+# Without this restoration a helper unit resolves and launches the primary role,
+# port, and container even though its ExecStart explicitly requested otherwise.
+ROLE="$REQUESTED_ROLE"
+[ -n "$CALLER_PORT" ] && PORT="$CALLER_PORT"
+[ -n "$CALLER_CONTAINER_NAME" ] && CONTAINER_NAME="$CALLER_CONTAINER_NAME"
+export ROLE PORT CONTAINER_NAME
 
 ACTIVE_MODELS="${ACTIVE_MODELS:-$CONFIG_ROOT/active-models.toml}"
 RUNTIMES_INDEX="${RUNTIMES_INDEX:-$CONFIG_ROOT/runtimes.toml}"

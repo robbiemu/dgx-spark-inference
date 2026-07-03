@@ -1,0 +1,32 @@
+kind = "runtime-manifest"
+runtime_id = "sglang-v0.5.14-cu130-nvfp4fix1"
+runtime_kind = "sglang"
+promotion_state = "approved"
+approval_scope = "local-dgx-spark-2026-07-03"
+image = "local/sglang-runtime:v0.5.14-cu130-runtime-distro1.9.0-nvfp4fix"
+image_id = "sha256:9b8f86ccafb1b7e8856e8e689088f9d868febef965028b1d02a18a3083d67a5c"
+base_image = "local/sglang-runtime:v0.5.14-cu130-runtime-distro1.9.0"
+base_image_digest = "sha256:d49152ee427751c40859493ca8e34083b6722e0f5579b950508a3201f1ec32cf"
+launch_adapter = "adapters/sglang.sh"
+supported_config_kinds = ["model-runtime-config"]
+
+[common_launch]
+host_bind = "0.0.0.0"
+host_port = 30000
+container_cache_root = "/hf-cache"
+entrypoint_shape = "sglang serve --model-path <path> --config <yaml>"
+reasoning_parser = "qwen3"
+tool_call_parser = "qwen3_coder"
+log_level = "warning"
+log_level_http = "warning"
+context_length = 32768
+max_running_requests = 1
+max_queued_requests = 1
+attention_backend = "auto"
+
+[speculation]
+supported_algorithms = []
+notes = "Autoregressive qualification only; EAGLE/MTP is not approved."
+
+[known_limitations]
+fp8_kv_scale = "Checkpoint supplies no KV scaling factors; SGLang defaults to 1.0."

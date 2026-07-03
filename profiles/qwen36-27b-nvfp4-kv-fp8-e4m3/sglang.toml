@@ -1,0 +1,18 @@
+kind = "model-runtime-config"
+model_id = "qwen36-27b-nvfp4-kv-fp8-e4m3"
+runtime_id = "sglang-v0.5.14-cu130-nvfp4fix1"
+
+[identity]
+source_repository = "nvidia/Qwen3.6-27B-NVFP4"
+source_revision = "0893e1606ff3d5f97a441f405d5fc541a6bdf404"
+quantization = "nvfp4"
+model_dir = "hub/models--nvidia--Qwen3.6-27B-NVFP4/snapshots/0893e1606ff3d5f97a441f405d5fc541a6bdf404"
+
+[launch]
+context_length = 262144
+max_running_requests = 3
+max_queued_requests = 3
+max_total_tokens = 524288
+attention_backend = "auto"
+kv_cache_dtype = "fp8_e4m3"
+mem_fraction_static = 0.60

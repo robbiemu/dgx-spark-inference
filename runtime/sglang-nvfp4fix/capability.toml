@@ -1,0 +1,18 @@
+kind = "runtime-capability"
+runtime_id = "sglang-v0.5.14-cu130-nvfp4fix1"
+promotion_state = "approved"
+approval_scope = "local-dgx-spark-2026-07-03"
+runtime = "sglang"
+runtime_version = "0.5.14+nvfp4fix1"
+derived_image = "local/sglang-runtime:v0.5.14-cu130-runtime-distro1.9.0-nvfp4fix"
+container_cache_root = "/hf-cache"
+approved_profiles = [
+  "qwen36-27b-nvfp4-kv-fp8-e4m3-autoregressive",
+]
+
+[launch_requirements]
+device = "cuda"
+context_length = 262144
+reasoning_parser = "qwen3"
+tool_call_parser = "qwen3_coder"
+speculation = "disabled"

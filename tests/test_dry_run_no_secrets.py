@@ -45,6 +45,9 @@ def main() -> int:
             print(f"install --dry-run failed (rc={proc.returncode}):\n{proc.stderr}", file=sys.stderr)
             return 1
         out = proc.stdout
+        if "sglang-v0.5.14-cu130-nvfp4fix1" not in out:
+            print("FAIL: dry-run omitted the NVFP4 runtime registry entry", file=sys.stderr)
+            return 1
 
         # scan the rendered dry-run output with the contextual scanner.
         out_file = tdpath / "dryrun-output.txt"
