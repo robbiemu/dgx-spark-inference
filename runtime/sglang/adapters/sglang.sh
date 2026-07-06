@@ -31,6 +31,9 @@ MODEL_ID="$4"
 KIND="$5"
 SPEC="$6"
 SERVED_NAME="$7"
+CALLER_ROLE="$ROLE"
+CALLER_PORT="${PORT:-}"
+CALLER_CONTAINER_NAME="${CONTAINER_NAME:-}"
 
 # ---- operator configuration discovery --------------------------------------
 # SAFETY: a caller that supplies its own PORT/CONTAINER_NAME/etc. (e.g. the
@@ -43,6 +46,11 @@ if [ "${DGX_INFERENCE_EXPERIMENTAL:-0}" != "1" ]; then
   # shellcheck disable=SC1090,SC1091
   [ -f "$CONFIG_ROOT/inference.env" ] && . "$CONFIG_ROOT/inference.env"
 fi
+# Explicit per-unit identity inherited from dispatch wins over the shared
+# primary defaults. Experimental callers remain isolated by the branch above.
+ROLE="$CALLER_ROLE"
+[ -n "$CALLER_PORT" ] && PORT="$CALLER_PORT"
+[ -n "$CALLER_CONTAINER_NAME" ] && CONTAINER_NAME="$CALLER_CONTAINER_NAME"
 MODEL_CACHE_ROOT="${MODEL_CACHE_ROOT:?MODEL_CACHE_ROOT is required (export it, or set it in $CONFIG_ROOT/inference.env)}"
 PORT="${PORT:-30000}"
 CONTAINER_NAME="${CONTAINER_NAME:-inference-agentic}"
@@ -125,10 +133,11 @@ CACHE_ROOT="$(toml_get "$MANIFEST" common_launch.container_cache_root)"
 
 # ---- emit_yaml: the ONE render path (used live AND by the --emit-yaml probe) -
 # Writes (or prints, see mode) the runtime YAML from merged values.
-#   emit_yaml <mode: write|print> <ctx> <mr> <mq> <mfs> <mtt> <api_key_or_placeholder>
-# mfs = mem_fraction_static; mtt = max_total_tokens (both optional, "" = omit key).
+#   emit_yaml <mode: write|print> <ctx> <mr> <mq> <mfs> <mtt> <kv> <api_key_or_placeholder>
+# mfs = mem_fraction_static; mtt = max_total_tokens; kv = kv_cache_dtype
+# (all optional, "" = omit key).
 emit_yaml() {
-  local mode="$1" ctx="$2" mr="$3" mq="$4" mfs="$5" mtt="$6" key="$7" out
+  local mode="$1" ctx="$2" mr="$3" mq="$4" mfs="$5" mtt="$6" kv="$7" key="$8" out
   out=$({
     printf 'served-model-name: "%s"\n' "$SERVED_NAME"
     printf 'host: "%s"\n' "$HOST_BIND"
@@ -145,6 +154,9 @@ emit_yaml() {
     # Only emitted when set (via DGX_MAX_TOTAL_TOKENS from the preflight, or future
     # spec field). Empty = omit key = sglang's uncapped default behavior preserved.
     [ -n "$mtt" ] && printf 'max-total-tokens: %s\n' "$mtt"
+    # Cache precision is part of a serving profile's identity. Omit it unless a
+    # profile pins one, preserving SGLang's auto behavior for existing profiles.
+    [ -n "$kv" ] && printf 'kv-cache-dtype: "%s"\n' "$kv"
     printf 'reasoning-parser: "%s"\n' "$(toml_get "$MANIFEST" common_launch.reasoning_parser)"
     printf 'tool-call-parser: "%s"\n' "$(toml_get "$MANIFEST" common_launch.tool_call_parser)"
     printf 'log-level: "%s"\n' "$(toml_get "$MANIFEST" common_launch.log_level)"
@@ -171,8 +183,9 @@ if [ "${8:-}" = "emit-yaml" ]; then
   MR="$(pick "$SPEC_PATH" "$MANIFEST" launch.max_running_requests common_launch.max_running_requests)"
   MQ="$(pick "$SPEC_PATH" "$MANIFEST" launch.max_queued_requests common_launch.max_queued_requests)"
   MFS="${DGX_MEM_FRACTION_STATIC:-$(pick_optional "$SPEC_PATH" "$MANIFEST" launch.mem_fraction_static common_launch.mem_fraction_static || true)}"
-  MTT="${DGX_MAX_TOTAL_TOKENS:-}"
-  emit_yaml print "$CTX" "$MR" "$MQ" "$MFS" "$MTT" "REDACTED-PLACEHOLDER"
+  MTT="${DGX_MAX_TOTAL_TOKENS:-$(pick_optional "$SPEC_PATH" "$MANIFEST" launch.max_total_tokens common_launch.max_total_tokens || true)}"
+  KV="$(pick_optional "$SPEC_PATH" "$MANIFEST" launch.kv_cache_dtype common_launch.kv_cache_dtype || true)"
+  emit_yaml print "$CTX" "$MR" "$MQ" "$MFS" "$MTT" "$KV" "REDACTED-PLACEHOLDER"
   exit 0
 fi
 
@@ -205,8 +218,9 @@ EOF
   MR="$(pick "$SPEC_PATH" "$MANIFEST" launch.max_running_requests common_launch.max_running_requests)"
   MQ="$(pick "$SPEC_PATH" "$MANIFEST" launch.max_queued_requests common_launch.max_queued_requests)"
   MFS="${DGX_MEM_FRACTION_STATIC:-$(pick_optional "$SPEC_PATH" "$MANIFEST" launch.mem_fraction_static common_launch.mem_fraction_static || true)}"
-  MTT="${DGX_MAX_TOTAL_TOKENS:-}"
-  emit_yaml write "$CTX" "$MR" "$MQ" "$MFS" "$MTT" "$SGLANG_API_KEY"
+  MTT="${DGX_MAX_TOTAL_TOKENS:-$(pick_optional "$SPEC_PATH" "$MANIFEST" launch.max_total_tokens common_launch.max_total_tokens || true)}"
+  KV="$(pick_optional "$SPEC_PATH" "$MANIFEST" launch.kv_cache_dtype common_launch.kv_cache_dtype || true)"
+  emit_yaml write "$CTX" "$MR" "$MQ" "$MFS" "$MTT" "$KV" "$SGLANG_API_KEY"
   # Durable labels for resident discovery (admission.sh finds co-residents by
   # label, NOT by container name — name is mutable/operator-set, label is the
   # stable planner identity). ledger_revision ties the resident to the exact
@@ -253,8 +267,9 @@ EOF
   MR="$(pick "$SPEC_PATH" "$MANIFEST" launch.max_running_requests common_launch.max_running_requests)"
   MQ="$(pick "$SPEC_PATH" "$MANIFEST" launch.max_queued_requests common_launch.max_queued_requests)"
   MFS="${DGX_MEM_FRACTION_STATIC:-$(pick_optional "$SPEC_PATH" "$MANIFEST" launch.mem_fraction_static common_launch.mem_fraction_static || true)}"
-  MTT="${DGX_MAX_TOTAL_TOKENS:-}"
-  emit_yaml write "$CTX" "$MR" "$MQ" "$MFS" "$MTT" "$SGLANG_API_KEY"
+  MTT="${DGX_MAX_TOTAL_TOKENS:-$(pick_optional "$SPEC_PATH" "$MANIFEST" launch.max_total_tokens common_launch.max_total_tokens || true)}"
+  KV="$(pick_optional "$SPEC_PATH" "$MANIFEST" launch.kv_cache_dtype common_launch.kv_cache_dtype || true)"
+  emit_yaml write "$CTX" "$MR" "$MQ" "$MFS" "$MTT" "$KV" "$SGLANG_API_KEY"
   LEDGER_REV=""
   [ -n "${DGX_MEMORY_LEDGER:-}" ] && [ -f "$DGX_MEMORY_LEDGER" ] \
     && LEDGER_REV="$(sha256sum "$DGX_MEMORY_LEDGER" 2>/dev/null | cut -c1-16)"

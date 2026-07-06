@@ -91,11 +91,18 @@ OPERATOR_STATE=(active-models.toml runtimes.toml)
 install_program_tree() {
   srun install -d -m 0755 "$INSTALL_ROOT"
   srun install -d -m 0755 "$INSTALL_ROOT/src/inferencectl" \
-                  "$INSTALL_ROOT/tools" "$INSTALL_ROOT/runtime/sglang/adapters" \
+                  "$INSTALL_ROOT/tools" "$INSTALL_ROOT/tools/memory_planner" \
+                  "$INSTALL_ROOT/runtime/sglang/adapters" \
                   "$INSTALL_ROOT/experiments/dflash"
   srun install -m 0755 "$SOURCE_DIR/src/inferencectl/dispatch.sh"        "$INSTALL_ROOT/src/inferencectl/dispatch.sh"
   srun install -m 0755 "$SOURCE_DIR/src/inferencectl/inference-cli.sh"   "$INSTALL_ROOT/src/inferencectl/inference-cli.sh"
+  srun install -m 0755 "$SOURCE_DIR/src/inferencectl/admission.sh"       "$INSTALL_ROOT/src/inferencectl/admission.sh"
   srun install -m 0755 "$SOURCE_DIR/tools/resolve_service_plan.py"       "$INSTALL_ROOT/tools/resolve_service_plan.py"
+  srun install -m 0755 "$SOURCE_DIR/tools/bind_active_runtime.py"        "$INSTALL_ROOT/tools/bind_active_runtime.py"
+  srun install -m 0755 "$SOURCE_DIR/tools/validate_agentic_endpoint.py"  "$INSTALL_ROOT/tools/validate_agentic_endpoint.py"
+  srun install -m 0755 "$SOURCE_DIR/tools/wait_for_health.sh"            "$INSTALL_ROOT/tools/wait_for_health.sh"
+  srun install -m 0755 "$SOURCE_DIR/tools/memory_planner/resolve_memory_plan.py" \
+                       "$INSTALL_ROOT/tools/memory_planner/resolve_memory_plan.py"
   srun install -m 0644 "$SOURCE_DIR/runtime/sglang/runtime-manifest.toml" "$INSTALL_ROOT/runtime/sglang/runtime-manifest.toml"
   srun install -m 0644 "$SOURCE_DIR/runtime/sglang/Dockerfile"            "$INSTALL_ROOT/runtime/sglang/Dockerfile"
   srun install -m 0644 "$SOURCE_DIR/runtime/sglang/available.toml"        "$INSTALL_ROOT/runtime/sglang/available.toml"
@@ -132,6 +139,7 @@ render_runtimes() {
 # INSTALL_ROOT, not a Git checkout. See docs/architecture.md.
 [runtimes.sglang-v0.5.14-cu130-runtime-distro1.9.0]
 project_root = "$INSTALL_ROOT/runtime/sglang"
+
 EOF
 }
 

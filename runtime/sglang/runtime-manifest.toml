@@ -37,6 +37,9 @@ attention_backend    = "auto"
 # (the realized KV pool is derived). It has NO default here: when a model does not
 # state it, the adapter OMITS the key and sglang computes the fraction itself
 # (unchanged behavior). See adapters/sglang.sh::emit_yaml.
+# kv_cache_dtype is also optional profile vocabulary. When omitted, SGLang's
+# automatic cache dtype remains unchanged. Profiles that set it are distinct
+# serving configurations and must be qualified independently.
 
 # Speculation algorithms this runtime supports (the mechanism; which pair uses
 # which algorithm is decided by a bundle config, not here).

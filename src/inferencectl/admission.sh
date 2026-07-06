@@ -32,8 +32,19 @@ set -Eeuo pipefail
 ROLE="$1"; RUNTIME_ROOT="$2"; PROJECT_ROOT="$3"; MODEL_ID="$4"
 KIND="$5"; SPEC="$6"; SERVED="$7"; ADAPTER="$8"
 
+# Preserve per-unit slot identity before loading shared primary defaults.
+CALLER_ROLE="$ROLE"
+CALLER_PORT="${PORT:-}"
+CALLER_CONTAINER_NAME="${CONTAINER_NAME:-}"
+
 CONFIG_ROOT="${CONFIG_ROOT:-/etc/dgx-spark-inference}"
 [ -f "$CONFIG_ROOT/inference.env" ] && . "$CONFIG_ROOT/inference.env"
+
+# Per-unit values win over inference.env's primary-slot defaults.
+ROLE="$CALLER_ROLE"
+[ -n "$CALLER_PORT" ] && PORT="$CALLER_PORT"
+[ -n "$CALLER_CONTAINER_NAME" ] && CONTAINER_NAME="$CALLER_CONTAINER_NAME"
+export ROLE PORT CONTAINER_NAME
 
 # Resolve the memory planner (repo-shipped; installed alongside the adapter).
 PLANNER="${DGX_MEMORY_PLANNER:-$PROJECT_ROOT/tools/memory_planner/resolve_memory_plan.py}"
