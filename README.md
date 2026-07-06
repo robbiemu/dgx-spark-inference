@@ -83,7 +83,7 @@ Out of the box, the repo is set up to run one role like this:
 | Context contract      | 262,144 tokens                               |
 | Baseline concurrency  | 1 running request, 1 queued request          |
 | Endpoint              | Authenticated local service on port `30000`  |
-| Unit                  | `inference-agentic.service`                  |
+| Unit                  | `dgx-spark-inference.service`                  |
 
 The profile is where model identity, revision, quantization, and launch parameters all live. We don't ship weights in this repo — your host pulls them into its own Hugging Face cache the first time the role starts.
 
@@ -160,37 +160,47 @@ Every launch takes a global lock before it measures anything, and holds it throu
 ### The two SGLang memory knobs
 
 ```text
-mem_fraction_static = static_required / A_preload
+mem_fraction_static = static_required / fraction_base
 max_total_tokens    = role-specific KV-pool ceiling
 ```
 
-`mem_fraction_static` gets derived fresh from whatever GPU memory is free right before launch. `max_total_tokens` caps the KV pool at each role's configured ceiling, even if there's plenty of free memory when the process starts. Between the two, every role lands on a stable static-memory footprint no matter what order things came up in.
+`max_total_tokens` caps the KV pool at each role's configured ceiling, even if more memory is free when the process starts.
+
+`mem_fraction_static` is derived at launch from the profile's measured static requirement and the `fraction_base` recorded in that profile's ledger entry:
+
+* `a_preload` means the available GPU memory at the model's load moment.
+* `device_total` means the full device memory.
+
+`a_preload` is the normal default. `device_total` is a runtime-path calibration: it may be used only when the profile was measured with that same base and repeated validation shows that SGLang applies `mem_fraction_static` against device total for that path.
+
+The measurement tool records `fraction_base` in the emitted ledger entry. Do not hand-swap it later: a budget measured against one base must be resolved against that same base.
+
+Together, the derived fraction and `max_total_tokens` make a role's static allocation and KV-pool ceiling deliberate rather than dependent on startup order.
 
 ---
 
 ### The measured budget ledger
 
 ```toml
-[profiles.primary]
-weights_gib                    = <measured>
-target_pool_tokens             = <measured>
-minimum_admissible_pool_tokens = 262144
-kv_bytes_per_token             = <measured>
-static_overhead_gib            = <measured>
-cuda_graph_peak_gib            = <measured>
-request_workspace_gib          = <measured>
+[[profiles]]
+model_id = "primary"
 
-[profiles.helper]
-weights_gib                    = <measured>
-target_pool_tokens             = <measured>
-minimum_admissible_pool_tokens = <role requirement>
-kv_bytes_per_token             = <measured>
-static_overhead_gib            = <measured>
-cuda_graph_peak_gib            = <measured>
-request_workspace_gib          = <measured>
+[profiles.budget]
+weights_gib =
+target_kv_tokens =
+minimum_admissible_pool_tokens =
+kv_bytes_per_token =
+static_pad_gib =
+static_overhead_gib =
+cuda_graph_peak_gib =
+request_workspace_gib =
+gpu_headroom_gib =
+fraction_base = "a_preload"
 ```
 
-Rather than keeping a separate budget for every possible combination of resident roles, the ledger just records measured numbers per profile. Add a role, add one profile entry — the admission logic figures out the rest at launch time.
+The ledger records one measured budget per model profile. Repeat the `[[profiles]]` entry for each profile that is eligible for planner admission.
+
+`fraction_base` is part of that measured budget. It records whether the measurement used `a_preload` or `device_total` as the denominator for `mem_fraction_static`.
 
 ---
 
@@ -627,6 +637,7 @@ curl -s http://127.0.0.1:30000/health   # 200 = ready
   flow, and the honest role of the resolver.
 - [`docs/operations.md`](docs/operations.md) — status/candidates/use/lifecycle/health.
 - [`docs/runbook.md`](docs/runbook.md) — day-2 operations: diagnostics, rollback, upgrades.
+- [`docs/measure-model-budget.md`](docs/measure-model-budget.md) — measuring a model budget and enrolling it in planner admission.
 - [`docs/security.md`](docs/security.md) — the LAN-only firewall prerequisite.
 - [`docs/known-limitations.md`](docs/known-limitations.md) — GB10/DFlash/memory limits.
 - [`docs/smoke-test.md`](docs/smoke-test.md) — the release gate.

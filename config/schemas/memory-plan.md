@@ -11,6 +11,8 @@ remains deliberately OFF the live path (forbidden anti-pattern). See
 the design rationale (why a *derived* fraction + `max_total_tokens` cap, not a
 static fraction or enumerated residency sets).
 
+#
+# For measuring new profiles step-by-step, see docs/measure-model-budget.md.
 The planner turns a per-model **budget ledger** + a **residency plan** into the
 two launch knobs SGLang needs and runs two admission gates. It is stdlib-only,
 no GPU.
@@ -31,6 +33,10 @@ plain string, not a TOML table path). Required `[profiles.budget]` fields:
 - `cuda_graph_peak_gib`, `request_workspace_gib` — transient peak (graph capture
   beyond the static budget; per-request activations)
 - `static_pad_gib`, `gpu_headroom_gib` — alignment/allocator cushions
+- `fraction_base` — "a_preload" (default) or "device_total". An SGLang
+runtime-path calibration (not a model-intrinsic property) determining which
+base the resolver derives mem_fraction_static against. Calibrate by comparing
+predicted versus realized pool sizes; see docs/measure-model-budget.md.
 
 ### `static_overhead_gib` — the large-model asymmetry (important)
 

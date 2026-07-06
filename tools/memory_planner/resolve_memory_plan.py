@@ -71,6 +71,20 @@ class Budget:
     request_workspace_gib: float = 0.0    # transient peak (per-request activations)
     memavailable_floor_gib: float = 8.0   # GB10 unified-memory safety floor
     gpu_headroom_gib: float = 1.0         # safety slack for allocator effects
+    fraction_base: str = "a_preload"      # "a_preload" (default) or "device_total"
+                                           # which base the resolver derives mem_fraction_static
+                                           # against. This is an SGLang runtime-path calibration,
+                                           # not a model-intrinsic property — determine it via
+                                           # the calibration procedure in docs/measure-model-budget.md.
+
+    VALID_FRACTION_BASES = frozenset({"a_preload", "device_total"})
+
+    def __post_init__(self) -> None:
+        if self.fraction_base not in self.VALID_FRACTION_BASES:
+            raise ValueError(
+                f"invalid fraction_base {self.fraction_base!r} for {self.model_id} "
+                f"(must be one of: {", ".join(sorted(self.VALID_FRACTION_BASES))})"
+            )
 
     @property
     def static_required_gib(self) -> float:
@@ -85,11 +99,21 @@ class Budget:
         # static + the transient peak (graphs + per-request workspace).
         return self.static_required_gib + self.cuda_graph_peak_gib + self.request_workspace_gib
 
-    def derive_fraction(self, a_preload_gib: float) -> float:
-        """The DERIVED mem_fraction_static for this model at launch time."""
-        if a_preload_gib <= 0:
-            raise ValueError(f"{self.model_id}: A_preload must be > 0 (got {a_preload_gib})")
-        return self.static_required_gib / a_preload_gib
+    def derive_fraction(self, a_preload_gib: float, device_total_gib: float = 0.0) -> float:
+        """The DERIVED mem_fraction_static for this model at launch time.
+
+        The base depends on how sglang interprets mem_fraction_static for this
+        model — measured per model via the measurement script. See
+        docs/measure-model-budget.md for how to determine the right value.
+        """
+        if self.fraction_base == "device_total":
+            if device_total_gib <= 0:
+                raise ValueError(f"{self.model_id}: device_total required for fraction_base=device_total")
+            return self.static_required_gib / device_total_gib
+        else:
+            if a_preload_gib <= 0:
+                raise ValueError(f"{self.model_id}: A_preload must be > 0 (got {a_preload_gib})")
+            return self.static_required_gib / a_preload_gib
 
 
 @dataclass
@@ -130,6 +154,7 @@ class AdmissionResult:
 def admit(
     budget: Budget,
     a_preload_gib: float,
+    device_total_gib: float,
     memavailable_before_gib: float,
 ) -> AdmissionResult:
     """Run both admission gates for one model against observed free memory.
@@ -139,7 +164,7 @@ def admit(
     memavailable_before_gib: host MemAvailable just before this model loads
                           (already reduced by resident models' peaks).
     """
-    fraction = budget.derive_fraction(a_preload_gib)
+    fraction = budget.derive_fraction(a_preload_gib, device_total_gib)
     # max_total_tokens is the target — the cap that makes load order safe.
     max_total_tokens = budget.target_kv_tokens
 
@@ -200,6 +225,7 @@ def load_budgets(ledger_path: str) -> dict[str, Budget]:
             request_workspace_gib=float(b.get("request_workspace_gib", 0.0)),
             memavailable_floor_gib=float(b.get("memavailable_floor_gib", 8.0)),
             gpu_headroom_gib=float(b.get("gpu_headroom_gib", 1.0)),
+            fraction_base=str(b.get("fraction_base", "a_preload")),
         )
     return out
 
@@ -273,7 +299,7 @@ def resolve(ledger_path: str, plan_path: str, dry_run: bool = False) -> int:
         # A_preload = GPU free at this model's load moment (residents' peaks already subtracted).
         a_preload = gpu_free_gib
         # Linux gate gets the MemAvailable just BEFORE this model loads (running counter).
-        r = admit(b, a_preload, memavailable_gib)
+        r = admit(b, a_preload, device_total_gib, memavailable_gib)
         results.append(r)
         print(f"## role={role}  model={mid}")
         print(f"  A_preload            = {r.a_preload_gib:.2f} GiB")
@@ -330,16 +356,20 @@ def main() -> int:
                     help="json = machine-readable contract for the dispatcher (default text)")
     a = ap.parse_args()
 
-    if a.format == "json":
-        # Suppress the human-readable prose resolve() prints; emit structured JSON instead.
-        import io, contextlib
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            results, rc = resolve(a.ledger, a.plan, a.dry_run)
-        emit_json(results, rc)
+    try:
+        if a.format == "json":
+            # Suppress the human-readable prose resolve() prints; emit structured JSON instead.
+            import io, contextlib
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                results, rc = resolve(a.ledger, a.plan, a.dry_run)
+            emit_json(results, rc)
+            return rc
+        results, rc = resolve(a.ledger, a.plan, a.dry_run)
         return rc
-    results, rc = resolve(a.ledger, a.plan, a.dry_run)
-    return rc
+    except ValueError as e:
+        print(f"REFUSING: {e}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
