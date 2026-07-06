@@ -45,7 +45,6 @@ def main() -> int:
             print(f"install --dry-run failed (rc={proc.returncode}):\n{proc.stderr}", file=sys.stderr)
             return 1
         out = proc.stdout
-
         # scan the rendered dry-run output with the contextual scanner.
         out_file = tdpath / "dryrun-output.txt"
         out_file.write_text(out)

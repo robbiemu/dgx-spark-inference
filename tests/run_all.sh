@@ -63,6 +63,14 @@ python3 tests/test_admission_pair_atomicity.py || fail=1
 say "Test 10 — admission live-path invariants (review blockers: dispatch delegation, measured A_preload, plan floor, probe-fail-auto)"
 python3 tests/test_admission_live_path.py || fail=1
 
+say "Test 11 — explicit KV-cache dtype profiles preserve baseline auto behavior"
+
+say "Test 12 — health-wait gate succeeds and fails closed"
+python3 tests/test_wait_for_health.py || fail=1
+
+say "Test 14 — authenticated endpoint validator parses"
+python3 -m py_compile tools/validate_agentic_endpoint.py || fail=1
+
 say "Repository-wide contextual secret scan"
 python3 tests/scan_secrets.py "$ROOT" || fail=1
 
