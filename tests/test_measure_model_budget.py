@@ -149,6 +149,124 @@ def main() -> int:
     if not check("exit nonzero", rc != 0, f"rc={rc}"):
         fail += 1
 
+    # ---- fraction_base: --fraction-base and --device-total-gib ----
+
+    say("device_total without --device-total-gib: nonzero, empty stdout")
+    rc, out, err = run_tool(DENSE_LOG, "--model-id", "x", "--mem-fraction", "0.60",
+                            "--fraction-base", "device_total")
+    if not check("exit nonzero", rc != 0, f"rc={rc}"):
+        fail += 1
+    if not check("empty stdout", out.strip() == "", repr(out[:80])):
+        fail += 1
+    if not check("stderr mentions --device-total-gib", "device-total-gib" in err.lower()):
+        fail += 1
+
+    say("device_total with zero --device-total-gib: nonzero, empty stdout")
+    rc, out, err = run_tool(DENSE_LOG, "--model-id", "x", "--mem-fraction", "0.60",
+                            "--fraction-base", "device_total", "--device-total-gib", "0")
+    if not check("exit nonzero", rc != 0, f"rc={rc}"):
+        fail += 1
+    if not check("empty stdout", out.strip() == "", repr(out[:80])):
+        fail += 1
+
+    say("device_total with negative --device-total-gib: nonzero, empty stdout")
+    rc, out, err = run_tool(DENSE_LOG, "--model-id", "x", "--mem-fraction", "0.60",
+                            "--fraction-base", "device_total", "--device-total-gib", "-5")
+    if not check("exit nonzero", rc != 0, f"rc={rc}"):
+        fail += 1
+    if not check("empty stdout", out.strip() == "", repr(out[:80])):
+        fail += 1
+
+    say("invalid --fraction-base: argparse rejects (nonzero)")
+    rc, out, err = run_tool(DENSE_LOG, "--model-id", "x", "--mem-fraction", "0.60",
+                            "--fraction-base", "total_device")
+    if not check("exit nonzero", rc != 0, f"rc={rc}"):
+        fail += 1
+
+    say("device_total measurement emits fraction_base in TOML")
+    rc, out, err = run_tool(DENSE_LOG, "--model-id", "e2e-dt", "--mem-fraction", "0.60",
+                            "--fraction-base", "device_total", "--device-total-gib", "121.7")
+    if not check("exit 0", rc == 0, f"rc={rc}"):
+        fail += 1
+    else:
+        try:
+            entry = tomllib.loads(out.strip())
+            prof = entry["profiles"][0]
+            fb = prof["budget"].get("fraction_base")
+            if not check("fraction_base = device_total in TOML", fb == "device_total", f"got {fb}"):
+                fail += 1
+        except Exception as e:
+            check("TOML parses", False, str(e))
+            fail += 1
+
+    say("default (a_preload) emits fraction_base in TOML")
+    rc, out, err = run_tool(DENSE_LOG, "--model-id", "e2e-ap", "--mem-fraction", "0.60")
+    if not check("exit 0", rc == 0, f"rc={rc}"):
+        fail += 1
+    else:
+        try:
+            entry = tomllib.loads(out.strip())
+            prof = entry["profiles"][0]
+            fb = prof["budget"].get("fraction_base")
+            if not check("fraction_base = a_preload in TOML", fb == "a_preload", f"got {fb}"):
+                fail += 1
+        except Exception as e:
+            check("TOML parses", False, str(e))
+            fail += 1
+
+    # ---- End-to-end: measure(device_total) → resolve → fraction reproduces ----
+
+    say("E2E: device_total measure → resolve → fraction reproduces")
+    # Measure with device_total where a_preload != device_total
+    MEM_FRAC = 0.55
+    DEVICE_TOTAL = 121.7
+    rc, out, err = run_tool(DENSE_LOG, "--model-id", "e2e-roundtrip",
+                            "--mem-fraction", str(MEM_FRAC),
+                            "--fraction-base", "device_total",
+                            "--device-total-gib", str(DEVICE_TOTAL))
+    if not check("measure exit 0", rc == 0, f"rc={rc}"):
+        fail += 1
+    else:
+        # Write the emitted TOML + a plan to temp files and resolve
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False) as lf:
+            lf.write(out); lf.flush(); ledger_path = lf.name
+        plan_text = (
+            f"device.total_gib = {DEVICE_TOTAL}\n"
+            "[observed]\n"
+            "gpu_free_now_gib = 200.0\n"  # deliberately != device_total
+            "memavailable_now_gib = 200.0\n"
+            "[[admit]]\n"
+            'role = "test"\n'
+            'model_id = "e2e-roundtrip"\n'
+        )
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False) as pf:
+            pf.write(plan_text); pf.flush(); plan_path = pf.name
+        p = subprocess.run(
+            [sys.executable, str(ROOT / "tools" / "memory_planner" / "resolve_memory_plan.py"),
+             ledger_path, plan_path],
+            capture_output=True, text=True, timeout=10,
+        )
+        if not check("resolve exit 0", p.returncode == 0, f"rc={p.returncode}"):
+            fail += 1
+        else:
+            # Extract the emitted fraction from the resolver output
+            frac_str = None
+            for line in p.stdout.splitlines():
+                if "mem_fraction_static" in line and "=" in line:
+                    frac_str = line.split("=")[1].strip().split()[0]
+                    break
+            if frac_str is None:
+                check("resolved fraction found", False, p.stdout[:200])
+                fail += 1
+            else:
+                resolved_frac = float(frac_str)
+                # Should reproduce the original measured fraction within tolerance
+                ok = abs(resolved_frac - MEM_FRAC) < 0.01
+                if not check("resolved fraction reproduces measured", ok,
+                             f"expected ~{MEM_FRAC}, got {resolved_frac}"):
+                    fail += 1
+
     print()
     if fail:
         print(f"FAIL: {fail} check(s) failed")

@@ -199,15 +199,15 @@ class Measurement:
     # -- static_overhead_gib: the measured gap ------------------------------
 
     def compute_static_overhead(
-        self, mem_fraction: float, a_preload: float,
+        self, mem_fraction: float, base_value: float, base_name: str,
         weights: float, kv_tokens: int, kv_bytes: float,
         static_pad: float, mamba_cache: float,
     ) -> float:
-        if a_preload <= 0 or kv_tokens <= 0:
-            self.record("static_overhead_gib", 0.0, "(cannot compute: missing A_preload or pool)")
+        if base_value <= 0 or kv_tokens <= 0:
+            self.record("static_overhead_gib", 0.0, f"(cannot compute: missing {base_name} or pool)")
             return 0.0
         kv_gib = (kv_tokens * kv_bytes) / GIB
-        budget = mem_fraction * a_preload  # what the fraction reserved
+        budget = mem_fraction * base_value  # what the fraction reserved
         components = weights + kv_gib + static_pad
         overhead = budget - components
         if overhead < 0:
@@ -223,7 +223,7 @@ class Measurement:
         self.record(
             "static_overhead_gib",
             round(max(overhead_incl_mamba, 0.0), 2),
-            f"({mem_fraction} × {a_preload:.2f}) - ({weights:.2f} + {kv_gib:.2f} + {static_pad})"
+            f"({mem_fraction} × {base_value:.2f} [{base_name}]) - ({weights:.2f} + {kv_gib:.2f} + {static_pad})"
             + (f" [includes ~{mamba_cache:.2f} GiB Mamba state]" if mamba_cache > 0 else ""),
         )
         return max(overhead_incl_mamba, 0.0)
@@ -268,6 +268,7 @@ def emit_profile(
     gpu_headroom: float,
     minimum_pool: int,
     context_length: int,
+    fraction_base: str = "a_preload",
 ) -> str:
     """Emit a [[profiles]] TOML block ready to append to budget_ledger.toml."""
     lines = [
@@ -289,6 +290,7 @@ def emit_profile(
     lines.append(f"cuda_graph_peak_gib    = {cuda_graph_peak:.2f}")
     lines.append(f"request_workspace_gib  = {request_workspace}")
     lines.append(f"gpu_headroom_gib       = {gpu_headroom}")
+    lines.append(f'fraction_base           = "{fraction_base}"')
     return "\n".join(lines) + "\n"
 
 
@@ -317,12 +319,33 @@ def main() -> int:
                     help="request_workspace_gib (default: 2.0)")
     ap.add_argument("--gpu-headroom", type=float, default=1.0,
                     help="gpu_headroom_gib (default: 1.0)")
+    ap.add_argument("--fraction-base", choices=["a_preload", "device_total"], default="a_preload",
+                    help="which base the measured mem_fraction was applied against "
+                         "(default: a_preload). Use device_total when sglang applies "
+                         "mem_fraction_static against the full device total.")
+    ap.add_argument("--device-total-gib", type=float, default=None,
+                    help="device total in GiB (required when --fraction-base=device_total)")
     args = ap.parse_args()
 
     # Validate mem_fraction (must be a valid fraction: >0, <=1)
     if not (0 < args.mem_fraction <= 1):
         print(f"REFUSE: --mem-fraction must be in (0, 1], got {args.mem_fraction}", file=sys.stderr)
         return 2
+
+    # Validate fraction_base / device_total consistency
+    if args.fraction_base == "device_total":
+        if args.device_total_gib is None:
+            print(
+                "REFUSE: --device-total-gib is required when --fraction-base=device_total.",
+                file=sys.stderr,
+            )
+            return 2
+        if args.device_total_gib <= 0:
+            print(
+                f"REFUSE: --device-total-gib must be positive, got {args.device_total_gib}.",
+                file=sys.stderr,
+            )
+            return 2
 
     # Read the log
     if args.log:
@@ -344,8 +367,16 @@ def main() -> int:
     a_preload = m.measure_a_preload(lines)
     avail_post = m.measure_available_gpu_mem(lines)
     ctx = args.context_length or m.measure_context_length(lines)
+    # Determine the measurement base value for overhead computation.
+    if args.fraction_base == "device_total":
+        base_value = args.device_total_gib
+        base_name = "device_total"
+    else:
+        base_value = a_preload
+        base_name = "a_preload"
     static_overhead = m.compute_static_overhead(
-        args.mem_fraction, a_preload, weights, kv_tokens, kv_bytes,
+        args.mem_fraction, base_value, base_name,
+        weights, kv_tokens, kv_bytes,
         args.static_pad, mamba_cache,
     )
 
@@ -418,6 +449,7 @@ def main() -> int:
         gpu_headroom=args.gpu_headroom,
         minimum_pool=args.minimum_pool,
         context_length=ctx,
+        fraction_base=args.fraction_base,
     )
     print(toml)
     return 0
