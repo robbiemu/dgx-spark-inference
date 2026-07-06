@@ -19,48 +19,76 @@ and enroll the planner. It takes one restart cycle per model.
 - A few minutes of GPU time for one launch with `--log-level info`.
 - The measurement tool: `tools/memory_planner/measure_model_budget.py`.
 
-## Step 1 — Capture an info-level startup log
+## Variables
 
-Launch the model once with `--log-level info` and capture the full startup
-output. The detailed memory lines (`Load weight end`, `KV Cache is allocated`,
-`Mamba Cache is allocated`, CUDA graph capture) only appear at `info` level.
-
-If your model is managed by the dispatch system, temporarily set `log_level` to
-`"info"` in the runtime manifest's `[common_launch]`, restart, capture, then
-revert:
+Set these to match your deployment. The defaults below are the reference
+deployment's primary (`agentic`) role; adjust for your role/unit.
 
 ```bash
-# Temporarily enable info logging (in the installed manifest)
-sudo sed -i 's/log_level         = "warning"/log_level         = "info"/' \
-  /usr/local/lib/dgx-spark-inference/runtime/sglang/runtime-manifest.toml
+# The systemd unit, container, and port for the role you are measuring.
+UNIT=dgx-spark-inference.service
+CONTAINER_NAME=inference-agentic
+PORT=30000
 
-# Restart and wait for health
-sudo systemctl restart dgx-spark-inference.service
-# ... wait for the service to come up ...
+# The installed runtime manifest (where log_level lives).
+MANIFEST=/usr/local/lib/dgx-spark-inference/runtime/sglang/runtime-manifest.toml
 
-# Capture the full startup log
-docker logs inference-agentic > /tmp/model_info.log 2>&1
+# Where this role keeps its API key (for the verification step).
+SECRET_FILE=/etc/dgx-spark-inference/agent.env
+TOKEN="$(sudo awk -F= '/^SGLANG_API_KEY=/{print $2; exit}' "$SECRET_FILE")"
 
-# Revert logging
-sudo sed -i 's/log_level         = "info"/log_level         = "warning"/' \
-  /usr/local/lib/dgx-spark-inference/runtime/sglang/runtime-manifest.toml
+# Output paths.
+LOG=/tmp/model_info.log
+ENTRY=/tmp/new_profile.toml
 ```
 
-If launching manually (not via the dispatch system), pipe sglang's output
-directly:
+> **Discovering alternatives:** `systemctl list-units --type=service | grep
+> inference` lists managed inference units. Each unit's `ExecStart` names the
+> container and role. The manifest path is always under the install root's
+> `runtime/sglang/runtime-manifest.toml`.
+
+## Step 1 — Capture an info-level startup log
+
+Launch the model once with `--log-level info` and capture the startup output.
+The detailed memory lines (`Load weight end`, `KV Cache is allocated`,
+`Mamba Cache is allocated`, CUDA graph capture) only appear at `info` level.
+
+Use a backup-and-restore sequence so the temporary edit is always reverted,
+then restart so the running process returns to its normal log level:
 
 ```bash
-python3 -m sglang.launch_server ... --log-level info 2>&1 | tee /tmp/model_info.log
+# Back up the manifest.
+sudo cp "$MANIFEST" "${MANIFEST}.before-measurement"
+
+# Temporarily enable info logging.
+sudo sed -i 's/^log_level         = "warning"/log_level         = "info"/' "$MANIFEST"
+
+# Restart and wait for health.
+sudo systemctl restart "$UNIT"
+# Poll until healthy (timeout 5 min):
+for i in $(seq 1 60); do
+  code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/health" \
+    -H "Authorization: Bearer $TOKEN")
+  [ "$code" = "200" ] && break
+  sleep 5
+done
+
+# Capture THIS startup's log (not the container's full history).
+docker logs "$CONTAINER_NAME" --since "$(systemctl show -p ActiveEnterTimestamp "$UNIT" | cut -d= -f2)" > "$LOG" 2>&1
+
+# Restore the manifest and restart so the running process uses normal logging.
+sudo mv "${MANIFEST}.before-measurement" "$MANIFEST"
+sudo systemctl restart "$UNIT"
 ```
 
 ## Step 2 — Run the measurement tool
 
 ```bash
 python3 tools/memory_planner/measure_model_budget.py \
-  --log /tmp/model_info.log \
+  --log "$LOG" \
   --model-id my-model-id \
   --mem-fraction 0.60 \
-  > /tmp/new_profile.toml
+  > "$ENTRY"
 ```
 
 The tool prints a **derivation trace** to stderr (every field with its source
@@ -95,9 +123,9 @@ DERIVATION TRACE for my-model-id
 - **`static_overhead_gib`**: the measured gap between the fraction budget and
   the clean components. For large models this is substantial (CUDA graph
   capture, allocator fragmentation). **If it's negative**, the fraction is too
-  low — see Troubleshooting below.
-- **`cuda_graph_peak_gib`**: the transient graph-capture peak. Should be small
-  relative to weights.
+  low — re-run with a higher `--mem-fraction`.
+- **`cuda_graph_peak_gib`**: the transient graph-capture peak (optional; may
+  be 0 if graph capture is disabled).
 
 ### Adjusting the output
 
@@ -114,7 +142,7 @@ requires to function — e.g. 262144 for a full-context primary).
 Review the generated entry, adjust if needed, then append:
 
 ```bash
-cat /tmp/new_profile.toml >> tools/memory_planner/budget_ledger.toml
+cat "$ENTRY" >> tools/memory_planner/budget_ledger.toml
 ```
 
 Verify it parses and the resolver can find it:
@@ -135,16 +163,25 @@ model_id = "my-model-id"')
 
 Expect `ADMIT` with a derived `mem_fraction_static` and `max_total_tokens`.
 
-## Step 4 — Remove the hardcoded fraction from the profile
+## Step 4 — Keep the profile value as a legacy fallback
 
-If the profile has `mem_fraction_static` hardcoded, remove it. The planner
-sets it dynamically via the `DGX_MEM_FRACTION_STATIC` environment variable at
-launch time. A hardcoded value takes precedence and defeats the planner.
+**Do not remove `mem_fraction_static` from the profile.** The planner's
+`DGX_MEM_FRACTION_STATIC` environment override (exported by `admission.sh`
+when a planner pair is active) takes precedence over the profile value at
+launch time. The profile value serves as the **validated fallback** when the
+planner is not active (legacy/auto mode, or when `DGX_MEMORY_PREFLIGHT=off`).
 
-```bash
-# In profiles/my-model-id/sglang.toml, remove or comment out:
-# mem_fraction_static = 0.60
+The precedence chain:
+
 ```
+DGX_MEM_FRACTION_STATIC (env, exported only by admission.sh's planner path)
+  > profile launch.mem_fraction_static (the fallback)
+  > key omitted → sglang computes its own default
+```
+
+Keep the profile's `mem_fraction_static` at its previously validated value.
+If a launch must refuse rather than fall back without a planner decision, set
+`DGX_MEMORY_PREFLIGHT=required` in the unit's environment.
 
 ## Step 5 — Enroll the planner (place the ledger + plan in /etc)
 
@@ -153,13 +190,13 @@ The planner activates when it finds a **matched pair** in `CONFIG_ROOT`:
 "legacy launch" mode (no preflight).
 
 ```bash
-# The budget ledger (operator state — copy from the repo)
+# The budget ledger (operator state — copy from the repo).
 sudo install -m 0640 tools/memory_planner/budget_ledger.toml \
   /etc/dgx-spark-inference/memory_ledger.toml
 
-# The memory plan (operator state — write once, device-specific)
+# The memory plan (operator state — write once, device-specific).
 sudo tee /etc/dgx-spark-inference/memory_plan.toml > /dev/null << 'EOF'
-device.total_gib = 121.7   # your device total (check: python3 -c "import torch; print(torch.cuda.mem_get_info()[1]/(1<<30))")
+device.total_gib = 121.7   # your device total
 [policy]
 memavailable_floor_gib = 8.0   # host MemAvailable safety floor
 EOF
@@ -168,14 +205,14 @@ EOF
 ## Step 6 — Restart and verify
 
 ```bash
-sudo systemctl restart dgx-spark-inference.service
+sudo systemctl restart "$UNIT"
 ```
 
 Check the journal — admission should say "resolving memory plan" (not "legacy
 launch"):
 
 ```bash
-journalctl -eu dgx-spark-inference.service --since "5 min ago" | grep admission
+journalctl -eu "$UNIT" --since "5 min ago" | grep admission
 # expect: [admission] resolving memory plan ...
 #         [admission] admitted: mem_fraction_static=0.XXXX max_total_tokens=YYYYYY
 #         [admission] allocation verified: realized=YYYYYY tokens
@@ -184,40 +221,50 @@ journalctl -eu dgx-spark-inference.service --since "5 min ago" | grep admission
 Verify the realized pool:
 
 ```bash
-curl -s http://127.0.0.1:30000/get_server_info \
+curl -s "http://127.0.0.1:$PORT/get_server_info" \
   -H "Authorization: Bearer $TOKEN" \
   | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['max_total_num_tokens'])"
 ```
 
 The realized pool should be within `[minimum_admissible_pool_tokens,
 max_total_tokens]`. If it falls outside, admission kills the adapter — see
-Troubleshooting.
+Troubleshooting below.
 
-## The `fraction_base` parameter
+## The `fraction_base` calibration
 
-The resolver derives `mem_fraction_static = static_required / base`, where the
-base depends on how sglang interprets the fraction for a given model. Most
-models use the default:
+`fraction_base` determines which base the resolver derives
+`mem_fraction_static` against. It is an **SGLang runtime-path calibration**,
+not a model-intrinsic property — it depends on how sglang's allocator
+interprets the fraction for a given model/runtime combination.
 
-```toml
-fraction_base = "a_preload"   # default — derived against available GPU memory
-```
+The default is `"a_preload"` (derived against available GPU memory at launch
+time). This is correct for most models. To determine whether `"device_total"`
+is needed for yours:
 
-If a model's realized pool consistently falls short of the target despite the
-fraction being correct, try `device_total`:
+1. Keep `"a_preload"` (the default) and launch under a controlled, known
+   residency state.
+2. Compare the resolver's predicted `max_total_tokens` against the realized
+   pool reported by `/get_server_info`.
+3. Change to `"device_total"` only when repeated runs show that its prediction
+   matches the realized allocation better than `"a_preload"`.
+4. Re-validate under the intended co-resident state.
 
-```toml
-fraction_base = "device_total"  # derived against full device total
-```
-
-**How to tell which base is correct:** the `a_preload` base is correct when
-sglang's effective budget tracks the available (post-co-resident) memory. The
-`device_total` base is correct when sglang applies the fraction against the
-full device regardless of co-residents. When in doubt, use `a_preload` (the
-default) — it has been verified on hybrid GDN models with large allocator
-overhead.
+Do **not** swap bases based on a single symptom (e.g. "pool was small"). The
+relationship runs both ways: assuming `a_preload` when sglang uses
+`device_total` makes the fraction too large; assuming `device_total` when
+sglang uses `a_preload` makes it too small. Calibrate by comparing predicted
+versus realized across multiple runs.
 
 ## Troubleshooting
+
+### Multiple KV pools (composite KV allocation)
+
+If the measurement tool reports "multiple KV pools found," it refuses to emit
+a TOML entry. **Do not enroll this profile in planner mode.** The current
+ledger schema and resolver do not support composite KV allocation (e.g. MTP
+with separate target + draft pools). Keep the profile on the validated legacy
+path (hardcoded `mem_fraction_static`) until explicit multi-pool accounting
+is implemented.
 
 ### Realized pool is much smaller than the target
 
@@ -248,7 +295,9 @@ against the architecture if it seems surprisingly small.
 
 ## See also
 
-- `config/schemas/memory-plan.md` — field definitions and the overhead model
+- `config/schemas/memory-plan.md` — field definitions, the overhead model, and
+  the `fraction_base` parameter
 - `docs/v0_2_phase0_results.md` — the Phase 0 measurement methodology
 - `tools/memory_planner/resolve_memory_plan.py` — the resolver (run with no
   args for usage)
+- `tools/memory_planner/measure_model_budget.py` — the measurement tool

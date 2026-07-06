@@ -33,10 +33,10 @@ plain string, not a TOML table path). Required `[profiles.budget]` fields:
 - `cuda_graph_peak_gib`, `request_workspace_gib` — transient peak (graph capture
   beyond the static budget; per-request activations)
 - `static_pad_gib`, `gpu_headroom_gib` — alignment/allocator cushions
-- `fraction_base` — "a_preload" (default) or "device_total". Which base the resolver
-derives mem_fraction_static against. Most models use a_preload (available
-GPU memory at launch). Use device_total if sglang applies the fraction against
-the full device for a model. See docs/measure-model-budget.md.
+- `fraction_base` — "a_preload" (default) or "device_total". An SGLang
+runtime-path calibration (not a model-intrinsic property) determining which
+base the resolver derives mem_fraction_static against. Calibrate by comparing
+predicted versus realized pool sizes; see docs/measure-model-budget.md.
 
 ### `static_overhead_gib` — the large-model asymmetry (important)
 

@@ -140,8 +140,9 @@ class Measurement:
         else:
             kv_bytes = 0.0
             self.warn("KV cache line found but could not derive kv_bytes_per_token")
-        if len(kv_lines) > 1:
-            self.warn(f"multiple KV pools found ({len(kv_lines)}); using the largest ({best_tokens} tokens)")
+        # Note: main() checks pool count and refuses on multiple pools.
+        # This method still returns the largest for the trace, but the TOML
+        # is never emitted when pool_count > 1.
         self.record("target_kv_tokens", best_tokens, best_line[:120])
         self.record("kv_bytes_per_token", round(kv_bytes, 1), f"({best_k}+{best_v}) GiB / {best_tokens} tokens")
         return best_tokens, kv_bytes
@@ -318,6 +319,11 @@ def main() -> int:
                     help="gpu_headroom_gib (default: 1.0)")
     args = ap.parse_args()
 
+    # Validate mem_fraction (must be a valid fraction: >0, <=1)
+    if not (0 < args.mem_fraction <= 1):
+        print(f"REFUSE: --mem-fraction must be in (0, 1], got {args.mem_fraction}", file=sys.stderr)
+        return 2
+
     # Read the log
     if args.log:
         if not args.log.is_file():
@@ -342,6 +348,44 @@ def main() -> int:
         args.mem_fraction, a_preload, weights, kv_tokens, kv_bytes,
         args.static_pad, mamba_cache,
     )
+
+    # Hard-stop checks: refuse to emit TOML if the measurement is not ledger-ready.
+    # These print to stderr ONLY (no stdout) so a redirect to a TOML file
+    # produces an empty file, not a dangerous partial entry.
+    pool_count = len(_find_all(r"KV Cache is allocated\.", lines))
+    if pool_count > 1:
+        print(
+            "REFUSE: multiple KV pools found (" + str(pool_count) + ").\n"
+            "The current ledger schema and resolver do not support composite KV\n"
+            "allocation. Do not enroll this profile in planner mode. Keep it on\n"
+            "the validated legacy path until explicit multi-pool accounting is\n"
+            "implemented.",
+            file=sys.stderr,
+        )
+        return 2
+    if weights == 0:
+        print(
+            "REFUSE: no 'Load weight end.' lines found.\n"
+            "Required markers: 'Load weight begin.' (with avail mem), at least\n"
+            "one 'Load weight end.', and exactly one 'KV Cache is allocated.'",
+            file=sys.stderr,
+        )
+        return 2
+    if kv_tokens == 0 or kv_bytes == 0:
+        print(
+            "REFUSE: could not parse KV cache allocation (tokens or sizes missing/malformed).\n"
+            "Required: exactly one 'KV Cache is allocated.' line with #tokens,\n"
+            "K size, and V size fields.",
+            file=sys.stderr,
+        )
+        return 2
+    if a_preload == 0:
+        print(
+            "REFUSE: no 'Load weight begin.' line with avail mem found.\n"
+            "This marker is required to compute static_overhead_gib.",
+            file=sys.stderr,
+        )
+        return 2
 
     # Print the derivation trace to stderr (transparency)
     print("=" * 60, file=sys.stderr)

@@ -72,9 +72,19 @@ class Budget:
     memavailable_floor_gib: float = 8.0   # GB10 unified-memory safety floor
     gpu_headroom_gib: float = 1.0         # safety slack for allocator effects
     fraction_base: str = "a_preload"      # "a_preload" (default) or "device_total"
-                                           # which base sglang applies mem_fraction_static
-                                           # against for this model. Measure per model;
-                                           # see docs/measure-model-budget.md.
+                                           # which base the resolver derives mem_fraction_static
+                                           # against. This is an SGLang runtime-path calibration,
+                                           # not a model-intrinsic property — determine it via
+                                           # the calibration procedure in docs/measure-model-budget.md.
+
+    VALID_FRACTION_BASES = frozenset({"a_preload", "device_total"})
+
+    def __post_init__(self) -> None:
+        if self.fraction_base not in self.VALID_FRACTION_BASES:
+            raise ValueError(
+                f"invalid fraction_base {self.fraction_base!r} for {self.model_id} "
+                f"(must be one of: {", ".join(sorted(self.VALID_FRACTION_BASES))})"
+            )
 
     @property
     def static_required_gib(self) -> float:
@@ -346,16 +356,20 @@ def main() -> int:
                     help="json = machine-readable contract for the dispatcher (default text)")
     a = ap.parse_args()
 
-    if a.format == "json":
-        # Suppress the human-readable prose resolve() prints; emit structured JSON instead.
-        import io, contextlib
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            results, rc = resolve(a.ledger, a.plan, a.dry_run)
-        emit_json(results, rc)
+    try:
+        if a.format == "json":
+            # Suppress the human-readable prose resolve() prints; emit structured JSON instead.
+            import io, contextlib
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                results, rc = resolve(a.ledger, a.plan, a.dry_run)
+            emit_json(results, rc)
+            return rc
+        results, rc = resolve(a.ledger, a.plan, a.dry_run)
         return rc
-    results, rc = resolve(a.ledger, a.plan, a.dry_run)
-    return rc
+    except ValueError as e:
+        print(f"REFUSING: {e}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
