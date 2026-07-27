@@ -1,0 +1,33 @@
+# EXPERIMENTAL matched Laguna S 2.1 NVFP4 + DFlash bundle for one DGX Spark.
+kind = "bundle-runtime-config"
+bundle_id = "laguna-s-2.1-nvfp4-dflash"
+runtime_id = "sglang-main-27906"
+
+[components.target]
+model_id = "laguna-s-2.1-nvfp4"
+
+[components.drafter]
+model_id = "laguna-s-2.1-dflash-nvfp4"
+role = "drafter"
+
+[coordination]
+algorithm = "DFLASH"
+num_draft_tokens = 16
+
+[launch]
+context_length = 32768
+max_running_requests = 1
+max_queued_requests = 1
+attention_backend = "flashinfer"
+speculative_draft_attention_backend = "flashinfer"
+page_size = 1
+mem_fraction_static = 0.70
+kv_cache_dtype = "bfloat16"
+reasoning_parser = "poolside_v1"
+tool_call_parser = "poolside_v1"
+
+[known_limitations]
+status = "qualified at 32768 tokens on one DGX Spark; experimental role only"
+structured_output = "DFLASH rejects grammar-constrained requests"
+logprobs = "DFLASH rejects return_logprob requests"
+full_context = "262144 remains unqualified"

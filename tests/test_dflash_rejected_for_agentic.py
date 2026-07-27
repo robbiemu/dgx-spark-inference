@@ -21,7 +21,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 RESOLVER = ROOT / "tools" / "resolve_service_plan.py"
 
-DFLASH_CAP = ROOT / "bundles" / "experimental" / "qwen36-27b-fp8-dflash" / "capability.toml"
+DFLASH_CAPS = [
+    ROOT / "bundles" / "experimental" / "qwen36-27b-fp8-dflash" / "capability.toml",
+    ROOT / "bundles" / "experimental" / "laguna-s-2.1-nvfp4-dflash" / "capability.toml",
+]
 RUNTIME_CAP = ROOT / "runtime" / "sglang" / "capability.toml"
 
 REQUEST_TOML = """\
@@ -36,44 +39,52 @@ required_model_capabilities = [
 
 
 def main() -> int:
-    assert DFLASH_CAP.is_file(), f"missing {DFLASH_CAP}"
     assert RUNTIME_CAP.is_file(), f"missing {RUNTIME_CAP}"
-    # Sanity: the DFlash record must NOT claim structured_output (this is what we
-    # are testing the resolver enforces; if someone "fixes" it, fail loudly here).
     import tomllib
-    caps = tomllib.loads(DFLASH_CAP.read_text()).get("capabilities", [])
-    assert "structured_output" not in caps, (
-        "DFlash capability.toml must not claim structured_output; got: " + repr(caps)
-    )
-
-    with tempfile.TemporaryDirectory() as td:
-        tdpath = Path(td)
-        (tdpath / "request.toml").write_text(REQUEST_TOML)
-        models_dir = tdpath / "models"; models_dir.mkdir()
-        runtimes_dir = tdpath / "runtimes"; runtimes_dir.mkdir()
-        (models_dir / "dflash.toml").write_text(DFLASH_CAP.read_text())
-        (runtimes_dir / "sglang.toml").write_text(RUNTIME_CAP.read_text())
-
-        proc = subprocess.run(
-            [
-                sys.executable, str(RESOLVER),
-                "--request", str(tdpath / "request.toml"),
-                "--models-dir", str(models_dir),
-                "--runtimes-dir", str(runtimes_dir),
-                "--allow-unresolved",
-            ],
-            capture_output=True, text=True,
+    for dflash_cap in DFLASH_CAPS:
+        assert dflash_cap.is_file(), f"missing {dflash_cap}"
+        caps = tomllib.loads(dflash_cap.read_text()).get("capabilities", [])
+        assert "structured_output" not in caps, (
+            f"{dflash_cap} must not claim structured_output; got: {caps!r}"
         )
-        if proc.returncode not in (0, 2):
-            print(f"resolver crashed (rc={proc.returncode}):\n{proc.stderr}", file=sys.stderr)
-            return 1
-        result = json.loads(proc.stdout)
-        agentic = next((r for r in result.get("roles", []) if r.get("role") == "agentic"), None)
-        if agentic and agentic.get("status") == "resolved":
-            print(f"FAIL: DFlash was WRONGLY resolved for agentic: {agentic}", file=sys.stderr)
-            return 1
-        print("PASS: DFlash rejected for agentic (lacks grammar-constrained structured_output)")
-        return 0
+        assert "logprobs" not in caps and "return_logprob" not in caps, (
+            f"{dflash_cap} must not claim logprobs; got: {caps!r}"
+        )
+        if dflash_cap.parent.name == "laguna-s-2.1-nvfp4-dflash":
+            roles = tomllib.loads(dflash_cap.read_text()).get("roles", [])
+            assert roles == ["agentic-experimental"], (
+                f"Laguna DFlash must be isolated to agentic-experimental; "
+                f"got: {roles!r}"
+            )
+
+        with tempfile.TemporaryDirectory() as td:
+            tdpath = Path(td)
+            (tdpath / "request.toml").write_text(REQUEST_TOML)
+            models_dir = tdpath / "models"; models_dir.mkdir()
+            runtimes_dir = tdpath / "runtimes"; runtimes_dir.mkdir()
+            (models_dir / "dflash.toml").write_text(dflash_cap.read_text())
+            (runtimes_dir / "sglang.toml").write_text(RUNTIME_CAP.read_text())
+
+            proc = subprocess.run(
+                [
+                    sys.executable, str(RESOLVER),
+                    "--request", str(tdpath / "request.toml"),
+                    "--models-dir", str(models_dir),
+                    "--runtimes-dir", str(runtimes_dir),
+                    "--allow-unresolved",
+                ],
+                capture_output=True, text=True,
+            )
+            if proc.returncode not in (0, 2):
+                print(f"resolver crashed (rc={proc.returncode}):\n{proc.stderr}", file=sys.stderr)
+                return 1
+            result = json.loads(proc.stdout)
+            agentic = next((r for r in result.get("roles", []) if r.get("role") == "agentic"), None)
+            if agentic and agentic.get("status") == "resolved":
+                print(f"FAIL: {dflash_cap.parent.name} was WRONGLY resolved for agentic: {agentic}", file=sys.stderr)
+                return 1
+            print(f"PASS: {dflash_cap.parent.name} rejected for production agentic")
+    return 0
 
 
 if __name__ == "__main__":

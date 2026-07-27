@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """Test 3 — Available-catalog compatibility.
 
-Every candidate listed in the PRODUCTION runtime catalog
-(runtime/sglang/available.toml[agentic].models) must satisfy the agentic role
-according to the REAL resolver, using the REAL capability records in this repo.
-Guards the live artifact against a future edit reintroducing DFlash (or any other
-incompatible candidate) under agentic."""
+Every candidate listed in the PRODUCTION runtime catalog must satisfy its
+declared role according to the REAL resolver, using the REAL capability records
+in this repo. DFlash and experimental roles must be absent from this catalog."""
 from __future__ import annotations
 
 import json
@@ -43,7 +41,19 @@ def main() -> int:
         for path in (available, runtime_cap):
             assert path.is_file(), f"missing {path}"
         avail = tomllib.loads(available.read_text())
-        for role, role_catalog in avail.get("roles", {}).items():
+        roles = avail.get("roles", {})
+        if "agentic-experimental" in roles:
+            failures.append(
+                f"{runtime_dir.name}: experimental role leaked into production catalog"
+            )
+        for role, role_catalog in roles.items():
+            for candidate in role_catalog.get("models", []):
+                if "dflash" in candidate["id"].lower():
+                    failures.append(
+                        f"{runtime_dir.name}/{role}/{candidate['id']}: "
+                        "DFlash leaked into production catalog"
+                    )
+        for role, role_catalog in roles.items():
             candidates = role_catalog.get("models", [])
             assert candidates, f"{available}[{role}] lists no candidates"
             if role not in role_policy:
@@ -67,7 +77,7 @@ def main() -> int:
         for f in failures:
             print(f"  - {f}", file=sys.stderr)
         return 1
-    print("PASS: all production catalog candidates are capability-compatible")
+    print("PASS: production catalog is compatible and contains no experimental candidates")
     return 0
 
 

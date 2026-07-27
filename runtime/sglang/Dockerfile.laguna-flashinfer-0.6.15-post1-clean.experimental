@@ -1,0 +1,64 @@
+FROM lmsysorg/sglang:v0.5.15.post1-cu130-runtime@sha256:247fd6bfcdeabe3e382da5c557537440148d08fd30f2b482f01fa09e242fe185
+
+LABEL org.opencontainers.image.title="SGLang Laguna FlashInfer experimental runtime" \
+      org.opencontainers.image.description="Local derivative of the pinned SGLang runtime with a per-attention-group FlashInfer planning patch and matched FlashInfer 0.6.15.post1 packages." \
+      org.opencontainers.image.version="0.5.15.post1-laguna-flashinfer0.6.15.post1" \
+      org.opencontainers.image.revision="0b3bb0cbe31873994c9f989fddfe2f87ca839fdd+local-laguna-flashinfer-per-layer-heads-swa" \
+      org.opencontainers.image.base.name="lmsysorg/sglang:v0.5.15.post1-cu130-runtime" \
+      org.opencontainers.image.base.digest="sha256:247fd6bfcdeabe3e382da5c557537440148d08fd30f2b482f01fa09e242fe185" \
+      io.dgx-spark-inference.derivative="true" \
+      io.dgx-spark-inference.patch-file="patches/laguna-flashinfer-per-layer-heads-swa.patch"
+
+RUN python3 -m pip install \
+      --no-cache-dir \
+      --disable-pip-version-check \
+      "distro==1.9.0" \
+    && python3 -c 'from importlib.metadata import version; assert version("distro") == "1.9.0"'
+
+COPY patches/laguna-flashinfer-per-layer-heads-swa.patch /tmp/laguna-flashinfer-per-layer-heads-swa.patch
+
+RUN patch \
+      --batch \
+      --forward \
+      --directory=/sgl-workspace/sglang \
+      --strip=1 \
+      --input=/tmp/laguna-flashinfer-per-layer-heads-swa.patch \
+    && python3 -m py_compile \
+      /sgl-workspace/sglang/python/sglang/srt/layers/attention/flashinfer_backend.py \
+      /sgl-workspace/sglang/python/sglang/srt/models/laguna.py \
+    && rm -f /tmp/laguna-flashinfer-per-layer-heads-swa.patch
+
+RUN python3 -m pip install \
+      --no-cache-dir \
+      --disable-pip-version-check \
+      --upgrade \
+      --upgrade-strategy only-if-needed \
+      "flashinfer-python[cu13]==0.6.15.post1" \
+      "cuda-tile==1.5.0" \
+      "nccl4py==0.3.1" \
+    && python3 -m pip install \
+      --no-cache-dir \
+      --disable-pip-version-check \
+      --upgrade \
+      --index-url https://flashinfer.ai/whl \
+      "flashinfer-cubin==0.6.15.post1" \
+    && python3 -m pip install \
+      --no-cache-dir \
+      --disable-pip-version-check \
+      --upgrade \
+      --index-url https://flashinfer.ai/whl/cu130 \
+      "flashinfer-jit-cache==0.6.15.post1+cu130"
+
+RUN python3 - <<'PY'
+from importlib.metadata import version
+
+expected = {
+    "flashinfer-python": "0.6.15.post1",
+    "flashinfer-cubin": "0.6.15.post1",
+    "flashinfer-jit-cache": "0.6.15.post1+cu130",
+    "cuda-tile": "1.5.0",
+    "nccl4py": "0.3.1",
+}
+actual = {distribution: version(distribution) for distribution in expected}
+assert actual == expected, actual
+PY

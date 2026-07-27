@@ -1,0 +1,29 @@
+# Laguna S 2.1 NVFP4 target for the experimental matched DFlash bundle.
+kind = "model-runtime-config"
+model_id = "laguna-s-2.1-nvfp4"
+runtime_id = "sglang-main-27906"
+
+[identity]
+source_repository = "poolside/Laguna-S-2.1-NVFP4"
+source_revision = "b482b5d57fda6e4e562a652869bde24ba2a57c92"
+quantization = "nvfp4"
+precision = "mixed-nvfp4-bfloat16"
+
+[launch]
+needs_trust_remote_code = true
+context_length = 32768
+max_running_requests = 1
+max_queued_requests = 1
+attention_backend = "flashinfer"
+page_size = 1
+kv_cache_dtype = "bfloat16"
+reasoning_parser = "poolside_v1"
+tool_call_parser = "poolside_v1"
+
+[architecture]
+architectures = ["LagunaForCausalLM"]
+num_hidden_layers = 48
+num_experts = 256
+num_experts_per_tok = 10
+sliding_window = 512
+max_position_embeddings = 262144

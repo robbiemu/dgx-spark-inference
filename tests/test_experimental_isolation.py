@@ -26,6 +26,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 ADAPTER = ROOT / "runtime" / "sglang" / "adapters" / "sglang.sh"
 RUNTIME_ROOT = ROOT / "runtime" / "sglang"
+LAUNCHER = ROOT / "experiments" / "dflash" / "run-experimental.sh"
 SPEC_REL = "profiles/qwen36-27b-fp8/sglang.toml"
 
 CALLER_PORT = "30100"          # the experimental port
@@ -34,6 +35,23 @@ PROD_PORT = "30000"            # production port, recorded in the prod inference
 
 def main() -> int:
     assert ADAPTER.is_file(), f"missing {ADAPTER}"
+    assert LAUNCHER.is_file(), f"missing {LAUNCHER}"
+    launcher = LAUNCHER.read_text()
+    required_launcher_guards = [
+        "DGX_RUNTIME_IMAGE",
+        "DGX_RUNTIME_IMAGE_ID",
+        "v0.5.15.post1-laguna-flashinfer0.6.15.post1-clean-experimental",
+        "inference-agentic-helper.service",
+        "inference-agentic-helper",
+        'only 32768 is qualified',
+    ]
+    for marker in required_launcher_guards:
+        if marker not in launcher:
+            print(f"FAIL: isolated launcher lacks guard/pin: {marker}", file=sys.stderr)
+            return 1
+    if "262144" in launcher:
+        print("FAIL: isolated launcher still exposes the prohibited 262144 path", file=sys.stderr)
+        return 1
     td = tempfile.mkdtemp()
     # A "production" inference.env with the production port. If isolation is
     # broken, the adapter sources this and renders PROD_PORT.

@@ -1,0 +1,24 @@
+# Matched BF16 DFlash drafter for the Laguna S 2.1 NVFP4 target.
+kind = "model-runtime-config"
+model_id = "laguna-s-2.1-dflash-nvfp4"
+runtime_id = "sglang-main-27906"
+
+[identity]
+source_repository = "poolside/Laguna-S-2.1-DFlash-NVFP4"
+source_revision = "723794750422b3efbf3a7b3af76dffb4ba035943"
+quantization = "none"
+precision = "bfloat16"
+
+[launch]
+needs_trust_remote_code = true
+
+[architecture]
+architectures = ["DFlashLagunaForCausalLM"]
+num_hidden_layers = 6
+sliding_window = 512
+max_position_embeddings = 262144
+draft_vocab_size = 100352
+
+[dflash]
+block_size = 16
+num_target_layers = 48

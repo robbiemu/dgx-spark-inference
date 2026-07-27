@@ -9,9 +9,11 @@ the catalog lists. See [`../../docs/architecture.md`](../../docs/architecture.md
 
 | File | Purpose |
 |---|---|
-| `Dockerfile` | Builds the local sglang runtime image (a thin layer over the pinned upstream image). |
+| `Dockerfile` | Builds the pinned production SGLang runtime image. |
+| `Dockerfile.laguna-flashinfer-0.6.15-post1-clean.experimental` | Builds the separately pinned Laguna experimental image. |
+| `patches/laguna-flashinfer-per-layer-heads-swa.patch` | Experimental Laguna per-group query-head/window planning patch. |
 | `runtime-manifest.toml` | What the runtime *is*: image tag + **pinned image ID**, launch defaults, supported config kinds, known limitations. |
-| `available.toml` | The candidate catalog per role (production; DFlash is intentionally absent from `agentic`). |
+| `available.toml` | The production candidate catalog; DFlash is deliberately absent. |
 | `capability.toml` | The runtime capability record (resolver input). |
 | `adapters/sglang.sh` | The launch adapter (lives at the path the manifest declares). |
 

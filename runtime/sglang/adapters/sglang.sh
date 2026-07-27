@@ -55,8 +55,14 @@ MODEL_CACHE_ROOT="${MODEL_CACHE_ROOT:?MODEL_CACHE_ROOT is required (export it, o
 PORT="${PORT:-30000}"
 CONTAINER_NAME="${CONTAINER_NAME:-inference-agentic}"
 
-# Runtime config dir is on tmpfs; the YAML is rendered 0600 root:root here.
-RUNTIME_CONFIG_DIR="/run/${CONTAINER_NAME}"
+# Production uses root-owned tmpfs under /run. Experimental callers may supply a
+# private user-owned runtime directory because they intentionally run without
+# systemd/root; the launcher removes it on exit.
+if [ "${DGX_INFERENCE_EXPERIMENTAL:-0}" = "1" ]; then
+  RUNTIME_CONFIG_DIR="${DGX_RUNTIME_CONFIG_DIR:-${XDG_RUNTIME_DIR:-/tmp}/${CONTAINER_NAME}-${UID}}"
+else
+  RUNTIME_CONFIG_DIR="/run/${CONTAINER_NAME}"
+fi
 RUNTIME_CONFIG_HOST="${RUNTIME_CONFIG_DIR}/sglang.yaml"
 RUNTIME_CONFIG_CONTAINER="/etc/sglang-runtime/sglang.yaml"
 # SPEC may be relative (resolved against PROJECT_ROOT, the normal case) or
@@ -128,6 +134,13 @@ resolve_model_dir() {  # resolve_model_dir <spec> <cache_root> <container_cache_
 MANIFEST="$RUNTIME_ROOT/runtime-manifest.toml"
 IMAGE="$(toml_get "$MANIFEST" image)"
 EXPECTED_IMAGE_ID="$(toml_get "$MANIFEST" image_id)"
+# Experimental runs may select a separately pinned reproduction image without
+# mutating the production manifest. Both values are required as a pair.
+if [ "${DGX_INFERENCE_EXPERIMENTAL:-0}" = "1" ] && [ -n "${DGX_RUNTIME_IMAGE:-}" ]; then
+  [ -n "${DGX_RUNTIME_IMAGE_ID:-}" ] || { echo "REFUSING: DGX_RUNTIME_IMAGE_ID is required with DGX_RUNTIME_IMAGE" >&2; exit 1; }
+  IMAGE="$DGX_RUNTIME_IMAGE"
+  EXPECTED_IMAGE_ID="$DGX_RUNTIME_IMAGE_ID"
+fi
 HOST_BIND="$(toml_get "$MANIFEST" common_launch.host_bind)"
 CACHE_ROOT="$(toml_get "$MANIFEST" common_launch.container_cache_root)"
 
@@ -157,8 +170,8 @@ emit_yaml() {
     # Cache precision is part of a serving profile's identity. Omit it unless a
     # profile pins one, preserving SGLang's auto behavior for existing profiles.
     [ -n "$kv" ] && printf 'kv-cache-dtype: "%s"\n' "$kv"
-    printf 'reasoning-parser: "%s"\n' "$(toml_get "$MANIFEST" common_launch.reasoning_parser)"
-    printf 'tool-call-parser: "%s"\n' "$(toml_get "$MANIFEST" common_launch.tool_call_parser)"
+    printf 'reasoning-parser: "%s"\n' "$(pick "$SPEC_PATH" "$MANIFEST" launch.reasoning_parser common_launch.reasoning_parser)"
+    printf 'tool-call-parser: "%s"\n' "$(pick "$SPEC_PATH" "$MANIFEST" launch.tool_call_parser common_launch.tool_call_parser)"
     printf 'log-level: "%s"\n' "$(toml_get "$MANIFEST" common_launch.log_level)"
     printf 'log-level-http: "%s"\n' "$(toml_get "$MANIFEST" common_launch.log_level_http)"
     printf 'api-key: "%s"\n' "$key"
@@ -167,10 +180,18 @@ emit_yaml() {
     printf '%s\n' "$out"
     return
   fi
-  install -d -o root -g root -m 0700 "$RUNTIME_CONFIG_DIR"
+  if [ "${DGX_INFERENCE_EXPERIMENTAL:-0}" = "1" ]; then
+    install -d -m 0700 "$RUNTIME_CONFIG_DIR"
+  else
+    install -d -o root -g root -m 0700 "$RUNTIME_CONFIG_DIR"
+  fi
   local tmp="${RUNTIME_CONFIG_HOST}.tmp.$$"
   printf '%s\n' "$out" > "$tmp"
-  install -o root -g root -m 0600 "$tmp" "$RUNTIME_CONFIG_HOST"
+  if [ "${DGX_INFERENCE_EXPERIMENTAL:-0}" = "1" ]; then
+    install -m 0600 "$tmp" "$RUNTIME_CONFIG_HOST"
+  else
+    install -o root -g root -m 0600 "$tmp" "$RUNTIME_CONFIG_HOST"
+  fi
   rm -f "$tmp"
 }
 
@@ -199,6 +220,12 @@ ACTUAL_IMAGE_ID="$(/usr/bin/docker image inspect "$IMAGE" --format '{{.Id}}')"
   echo "REFUSING: image ID drifted (expected $EXPECTED_IMAGE_ID, got $ACTUAL_IMAGE_ID)." >&2; exit 1; }
 
 umask 077
+
+# Optional architecture/JIT hints for Blackwell development systems. They are
+# passed only when the operator sets them, preserving every existing launch.
+DOCKER_ENV_ARGS=()
+[ -n "${CUTE_DSL_ARCH:-}" ] && DOCKER_ENV_ARGS+=(--env "CUTE_DSL_ARCH=$CUTE_DSL_ARCH")
+[ -n "${MAX_JOBS:-}" ] && DOCKER_ENV_ARGS+=(--env "MAX_JOBS=$MAX_JOBS")
 
 # ===========================================================================
 if [ "$KIND" = "model" ]; then
@@ -235,6 +262,7 @@ EOF
     --label io.inferencectl.memory_profile="${MODEL_ID}" \
     --label io.inferencectl.ledger_revision="${LEDGER_REV}" \
     --publish "${HOST_BIND}:${PORT}:${PORT}" \
+    "${DOCKER_ENV_ARGS[@]}" \
     --volume "${MODEL_CACHE_ROOT}:${CACHE_ROOT}:ro" \
     --volume "${RUNTIME_CONFIG_HOST}:${RUNTIME_CONFIG_CONTAINER}:ro" \
     --entrypoint /bin/sh "$IMAGE" \
@@ -247,15 +275,15 @@ elif [ "$KIND" = "bundle" ]; then
   # from available.toml). This branch exists for the experimental path only.
   TARGET_ID="$(toml_get "$SPEC_PATH" components.target.model_id)"
   DRAFTER_ID="$(toml_get "$SPEC_PATH" components.drafter.model_id)"
-  TARGET_CFG="$PROJECT_ROOT/profiles/qwen36-27b-${TARGET_ID#qwen36-27b-}/sglang.toml"
-  DRAFTER_CFG="$PROJECT_ROOT/profiles/experimental/qwen36-27b-${DRAFTER_ID#qwen36-27b-}/sglang.toml"
+  TARGET_CFG="$PROJECT_ROOT/profiles/${TARGET_ID}/sglang.toml"
+  DRAFTER_CFG="$PROJECT_ROOT/profiles/experimental/${DRAFTER_ID}/sglang.toml"
   [ -f "$TARGET_CFG" ] || { echo "REFUSING: target config missing: $TARGET_CFG" >&2; exit 1; }
   [ -f "$DRAFTER_CFG" ] || { echo "REFUSING: drafter config missing: $DRAFTER_CFG" >&2; exit 1; }
   # Resolve target + drafter dirs the same way the single-model path does.
   IFS='|' read -r TARGET_CONTAINER_PATH TARGET_HOST_PATH <<EOF
 $(resolve_model_dir "$TARGET_CFG" "$MODEL_CACHE_ROOT" "$CACHE_ROOT")
 EOF
-  IFS='|' read -r _ DRAFTER_HOST_PATH <<EOF
+  IFS='|' read -r DRAFTER_CONTAINER_PATH DRAFTER_HOST_PATH <<EOF
 $(resolve_model_dir "$DRAFTER_CFG" "$MODEL_CACHE_ROOT" "$CACHE_ROOT")
 EOF
   [ -d "$TARGET_HOST_PATH" ] || { echo "REFUSING: target dir not found: $TARGET_HOST_PATH" >&2; exit 1; }
@@ -264,6 +292,7 @@ EOF
   NUM_DRAFT="$(toml_get "$SPEC_PATH" coordination.num_draft_tokens)"
   ATTN="$(pick "$SPEC_PATH" "$MANIFEST" launch.attention_backend common_launch.attention_backend)"
   CTX="$(pick "$SPEC_PATH" "$MANIFEST" launch.context_length common_launch.context_length)"
+  PAGE_SIZE="$(toml_get "$SPEC_PATH" launch.page_size 2>/dev/null || true)"
   MR="$(pick "$SPEC_PATH" "$MANIFEST" launch.max_running_requests common_launch.max_running_requests)"
   MQ="$(pick "$SPEC_PATH" "$MANIFEST" launch.max_queued_requests common_launch.max_queued_requests)"
   MFS="${DGX_MEM_FRACTION_STATIC:-$(pick_optional "$SPEC_PATH" "$MANIFEST" launch.mem_fraction_static common_launch.mem_fraction_static || true)}"
@@ -273,6 +302,18 @@ EOF
   LEDGER_REV=""
   [ -n "${DGX_MEMORY_LEDGER:-}" ] && [ -f "$DGX_MEMORY_LEDGER" ] \
     && LEDGER_REV="$(sha256sum "$DGX_MEMORY_LEDGER" 2>/dev/null | cut -c1-16)"
+  BUNDLE_ARGS=""
+  [ -n "$PAGE_SIZE" ] && BUNDLE_ARGS="--page-size $PAGE_SIZE"
+  BUNDLE_PREFILL_ATTN="$(toml_get "$SPEC_PATH" launch.prefill_attention_backend 2>/dev/null || true)"
+  [ -n "$BUNDLE_PREFILL_ATTN" ] && BUNDLE_ARGS="$BUNDLE_ARGS --prefill-attention-backend $BUNDLE_PREFILL_ATTN"
+  BUNDLE_DECODE_ATTN="$(toml_get "$SPEC_PATH" launch.decode_attention_backend 2>/dev/null || true)"
+  [ -n "$BUNDLE_DECODE_ATTN" ] && BUNDLE_ARGS="$BUNDLE_ARGS --decode-attention-backend $BUNDLE_DECODE_ATTN"
+  BUNDLE_DRAFT_ATTN="$(toml_get "$SPEC_PATH" launch.speculative_draft_attention_backend 2>/dev/null || true)"
+  [ -n "$BUNDLE_DRAFT_ATTN" ] && BUNDLE_ARGS="$BUNDLE_ARGS --speculative-draft-attention-backend $BUNDLE_DRAFT_ATTN"
+  BUNDLE_DISABLE_CUDA_GRAPH="$(toml_get "$SPEC_PATH" launch.disable_cuda_graph 2>/dev/null || true)"
+  [ "$BUNDLE_DISABLE_CUDA_GRAPH" = "True" ] && BUNDLE_ARGS="$BUNDLE_ARGS --disable-cuda-graph"
+  BUNDLE_FP4_BACKEND="$(toml_get "$SPEC_PATH" launch.fp4_gemm_backend 2>/dev/null || true)"
+  [ -n "$BUNDLE_FP4_BACKEND" ] && BUNDLE_ARGS="$BUNDLE_ARGS --fp4-gemm-backend $BUNDLE_FP4_BACKEND"
   exec /usr/bin/docker run \
     --rm --name "$CONTAINER_NAME" --gpus all --ipc host \
     --label io.inferencectl.managed=true \
@@ -280,16 +321,16 @@ EOF
     --label io.inferencectl.memory_profile="${MODEL_ID}" \
     --label io.inferencectl.ledger_revision="${LEDGER_REV}" \
     --publish "${HOST_BIND}:${PORT}:${PORT}" \
+    "${DOCKER_ENV_ARGS[@]}" \
     --volume "${MODEL_CACHE_ROOT}:${CACHE_ROOT}:ro" \
-    --volume "${DRAFTER_HOST_PATH}:/drafter:ro" \
     --volume "${RUNTIME_CONFIG_HOST}:${RUNTIME_CONFIG_CONTAINER}:ro" \
     --entrypoint /bin/sh "$IMAGE" \
     -ceu 'exec sglang serve --model-path "$1" --config "$2" \
         --speculative-algorithm "'"${ALGO}"'" \
-        --speculative-draft-model-path /drafter \
+        --speculative-draft-model-path "'"${DRAFTER_CONTAINER_PATH}"'" \
         --speculative-num-draft-tokens "'"${NUM_DRAFT}"'" \
-        --trust-remote-code --attention-backend "'"${ATTN}"'"' \
-    sh "$TARGET_CONTAINER_PATH" "$RUNTIME_CONFIG_CONTAINER"
+        --trust-remote-code --attention-backend "'"${ATTN}"'" $3' \
+    sh "$TARGET_CONTAINER_PATH" "$RUNTIME_CONFIG_CONTAINER" "$BUNDLE_ARGS"
 
 else
   echo "REFUSING: unknown kind '$KIND' (expected model|bundle)." >&2; exit 1

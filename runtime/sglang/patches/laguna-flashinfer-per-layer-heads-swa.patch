@@ -1,0 +1,525 @@
+--- a/python/sglang/srt/layers/attention/flashinfer_backend.py
++++ b/python/sglang/srt/layers/attention/flashinfer_backend.py
+@@ -26,7 +26,7 @@
+     assert_buffer_fits,
+     create_flashinfer_kv_indices_triton,
+ )
+-from sglang.srt.layers.radix_attention import AttentionType
++from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
+ from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+ from sglang.srt.model_executor.cuda_graph_config import (
+@@ -53,7 +53,6 @@
+ )
+ 
+ if TYPE_CHECKING:
+-    from sglang.srt.layers.radix_attention import RadixAttention
+     from sglang.srt.model_executor.model_runner import ModelRunner
+ 
+ logger = logging.getLogger(__name__)
+@@ -270,6 +269,17 @@
+     self._cached_o_data_type = o_data_type
+     self._block_tables = None
+ 
++    assert getattr(self, "_causal", causal) == causal, (
++        getattr(self, "_causal", None),
++        causal,
++    )
++    assert getattr(self, "_window_left", window_left) == window_left, (
++        getattr(self, "_window_left", None),
++        window_left,
++    )
++    self._causal = causal
++    self._window_left = window_left
++
+     args = [
+         self._float_workspace_buffer,
+         self._int_workspace_buffer,
+@@ -348,6 +358,63 @@
+             self.num_wrappers = 1
+             self.dispatch_reason = None
+ 
++        default_num_qo_heads = (
++            model_runner.model_config.num_attention_heads
++            // get_parallel().attn_tp_size
++        )
++        num_qo_head_sets = [set() for _ in range(self.num_wrappers)]
++        # TRTLLMHAAttnBackend inherits this initializer but replaces the
++        # FlashInfer metadata and kernels. Preserve its existing initialization
++        # behavior until it has a dedicated per-wrapper integration test.
++        if self.__class__ is FlashInferAttnBackend:
++            for module in model_runner.model.modules():
++                if isinstance(module, RadixAttention):
++                    num_qo_head_sets[self._get_wrapper_idx(module)].add(
++                        module.tp_q_head_num
++                    )
++
++        self.num_qo_heads_per_wrapper = []
++        for wrapper_id, num_qo_heads in enumerate(num_qo_head_sets):
++            if not num_qo_heads:
++                self.num_qo_heads_per_wrapper.append(default_num_qo_heads)
++                continue
++            if len(num_qo_heads) != 1:
++                raise ValueError(
++                    "FlashInfer wrapper group must have a uniform query-head "
++                    f"count, but wrapper {wrapper_id} has "
++                    f"{sorted(num_qo_heads)}"
++                )
++            self.num_qo_heads_per_wrapper.append(next(iter(num_qo_heads)))
++        logger.info(
++            "FlashInfer query heads per wrapper: %s",
++            self.num_qo_heads_per_wrapper,
++        )
++
++        window_left_sets = [set() for _ in range(self.num_wrappers)]
++        if self.__class__ is FlashInferAttnBackend:
++            for module in model_runner.model.modules():
++                if isinstance(module, RadixAttention):
++                    window_left = module.sliding_window_size
++                    window_left_sets[self._get_wrapper_idx(module)].add(
++                        -1 if window_left is None else int(window_left)
++                    )
++
++        self.window_left_per_wrapper = []
++        for wrapper_id, window_lefts in enumerate(window_left_sets):
++            if not window_lefts:
++                self.window_left_per_wrapper.append(-1)
++                continue
++            if len(window_lefts) != 1:
++                raise ValueError(
++                    "FlashInfer wrapper group must have a uniform window_left, "
++                    f"but wrapper {wrapper_id} has {sorted(window_lefts)}"
++                )
++            self.window_left_per_wrapper.append(next(iter(window_lefts)))
++        logger.info(
++            "FlashInfer window_left per wrapper: %s",
++            self.window_left_per_wrapper,
++        )
++
+         # Qwen2/Qwen3 models require higher flashinfer workspace size
+         if (
+             "Qwen2ForCausalLM" in model_runner.model_config.hf_config.architectures
+@@ -436,9 +503,12 @@
+             # due to TMA descriptor initialization issues on SM100 GPUs.
+             if not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE):
+                 fmha_backend = "cutlass"
+-        self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
+-            self.workspace_buffer, "NHD", backend=fmha_backend
+-        )
++        self.prefill_wrappers_ragged = [
++            BatchPrefillWithRaggedKVCacheWrapper(
++                self.workspace_buffer, "NHD", backend=fmha_backend
++            )
++            for _ in range(self.num_wrappers)
++        ]
+ 
+         # Two wrappers: one for sliding window attention and one for full attention.
+         # Using two wrappers is unnecessary in the current PR, but are prepared for future PRs
+@@ -1005,13 +1075,16 @@
+         device = self.workspace_buffer.device
+         self.full_cg_prefill_req_slots = num_slots
+         upd = self.indices_updater_prefill
+-        workspace_bytes = self._full_cg_prefill_workspace_bytes(
+-            num_slots,
+-            max_num_tokens,
+-            num_qo_heads=upd.num_qo_heads,
+-            num_kv_heads=upd.num_kv_heads,
+-            head_dim=upd.head_dim,
+-            device=device,
++        workspace_bytes = max(
++            self._full_cg_prefill_workspace_bytes(
++                num_slots,
++                max_num_tokens,
++                num_qo_heads=num_qo_heads,
++                num_kv_heads=upd.num_kv_heads,
++                head_dim=upd.head_dim,
++                device=device,
++            )
++            for num_qo_heads in upd.num_qo_heads_per_wrapper
+         )
+         logger.info(
+             "Full-CG prefill workspace: %.0f MB (max bucket %d tokens, "
+@@ -1106,9 +1179,44 @@
+         forward_batch: ForwardBatch,
+         save_kv_cache=True,
+     ):
+-        prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
+-            self._get_wrapper_idx(layer)
+-        ]
++        wrapper_idx = self._get_wrapper_idx(layer)
++        prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[wrapper_idx]
++        prefill_wrapper_ragged = self.prefill_wrappers_ragged[wrapper_idx]
++        assert self.num_qo_heads_per_wrapper[wrapper_idx] == layer.tp_q_head_num, (
++            wrapper_idx,
++            self.num_qo_heads_per_wrapper[wrapper_idx],
++            layer.tp_q_head_num,
++        )
++        layer_window_left = (
++            -1 if layer.sliding_window_size is None else layer.sliding_window_size
++        )
++        assert self.window_left_per_wrapper[wrapper_idx] == layer_window_left, (
++            wrapper_idx,
++            self.window_left_per_wrapper[wrapper_idx],
++            layer_window_left,
++        )
++        multi_item_enabled = bool(
++            self.forward_metadata.multi_item_params
++            and self.forward_metadata.multi_item_params.is_enabled()
++        )
++        window_left = (
++            -1
++            if multi_item_enabled
++            else self.window_left_per_wrapper[wrapper_idx]
++        )
++        assert getattr(prefill_wrapper_paged, "_window_left", None) == window_left, (
++            wrapper_idx,
++            getattr(prefill_wrapper_paged, "_window_left", None),
++            window_left,
++        )
++        if self.forward_metadata.use_ragged:
++            assert (
++                getattr(prefill_wrapper_ragged, "_window_left", None) == window_left
++            ), (
++                wrapper_idx,
++                getattr(prefill_wrapper_ragged, "_window_left", None),
++                window_left,
++            )
+         cache_loc = (
+             forward_batch.out_cache_loc
+             if not layer.is_cross_attention
+@@ -1146,14 +1254,7 @@
+                 # - Specialized multi-item parameters (prefix_len_ptr, token_pos_in_items_ptr)
+                 #   provide more precise attention control than simple sliding windows
+                 # - Item-aware masking takes precedence over window-based masking
+-                window_left=(
+-                    layer.sliding_window_size
+-                    if not (
+-                        self.forward_metadata.multi_item_params
+-                        and self.forward_metadata.multi_item_params.is_enabled()
+-                    )
+-                    else -1
+-                ),
++                window_left=window_left,
+                 logits_soft_cap=logits_soft_cap,
+                 # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
+                 k_scale=layer.k_scale_float,
+@@ -1180,31 +1281,24 @@
+                 # NOTE: FlashInfer currently has limitations with head_dim = 32 or other dimensions
+                 # The FlashInfer head_dim limitation itself is tracked here:
+                 # https://github.com/flashinfer-ai/flashinfer/issues/1048
+-                o = self.prefill_wrapper_ragged.forward(
++                o = prefill_wrapper_ragged.forward(
+                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                     v.view(-1, layer.tp_v_head_num, layer.head_dim),
+                     causal=causal,
+                     sm_scale=layer.scaling,
++                    window_left=window_left,
+                     logits_soft_cap=logits_soft_cap,
+                 )
+ 
+             else:
+-                swa_window_left = (
+-                    layer.sliding_window_size
+-                    if not (
+-                        self.forward_metadata.multi_item_params
+-                        and self.forward_metadata.multi_item_params.is_enabled()
+-                    )
+-                    else -1
+-                )
+-                o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
++                o1, s1 = prefill_wrapper_ragged.forward_return_lse(
+                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                     v.view(-1, layer.tp_v_head_num, layer.head_dim),
+                     causal=causal,
+                     sm_scale=layer.scaling,
+-                    window_left=swa_window_left,
++                    window_left=window_left,
+                     logits_soft_cap=logits_soft_cap,
+                 )
+                 o2, s2 = prefill_wrapper_paged.forward_return_lse(
+@@ -1212,7 +1306,7 @@
+                     self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                     causal=False,
+                     sm_scale=layer.scaling,
+-                    window_left=swa_window_left,
++                    window_left=window_left,
+                     logits_soft_cap=logits_soft_cap,
+                 )
+ 
+@@ -1240,9 +1334,27 @@
+         forward_batch: ForwardBatch,
+         save_kv_cache=True,
+     ):
+-        decode_wrapper = self.forward_metadata.decode_wrappers[
+-            self._get_wrapper_idx(layer)
+-        ]
++        wrapper_idx = self._get_wrapper_idx(layer)
++        decode_wrapper = self.forward_metadata.decode_wrappers[wrapper_idx]
++        assert self.num_qo_heads_per_wrapper[wrapper_idx] == layer.tp_q_head_num, (
++            wrapper_idx,
++            self.num_qo_heads_per_wrapper[wrapper_idx],
++            layer.tp_q_head_num,
++        )
++        layer_window_left = (
++            -1 if layer.sliding_window_size is None else layer.sliding_window_size
++        )
++        window_left = self.window_left_per_wrapper[wrapper_idx]
++        assert window_left == layer_window_left, (
++            wrapper_idx,
++            window_left,
++            layer_window_left,
++        )
++        assert getattr(decode_wrapper, "_window_left", None) == window_left, (
++            wrapper_idx,
++            getattr(decode_wrapper, "_window_left", None),
++            window_left,
++        )
+         cache_loc = (
+             forward_batch.out_cache_loc
+             if not layer.is_cross_attention
+@@ -1270,6 +1382,7 @@
+             # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
+             k_scale=layer.k_scale_float,
+             v_scale=layer.v_scale_float,
++            window_left=window_left,
+         )
+ 
+         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+@@ -1292,13 +1405,19 @@
+         self.num_qo_heads = (
+             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
+         )
++        self.num_qo_heads_per_wrapper = attn_backend.num_qo_heads_per_wrapper
++        self.window_left_per_wrapper = attn_backend.window_left_per_wrapper
+         self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
+             get_parallel().attn_tp_size
+         )
+         self.head_dim = model_runner.model_config.head_dim
+         self.data_type = model_runner.kv_cache_dtype
+         self.q_data_type = model_runner.dtype
+-        self.sliding_window_size = model_runner.sliding_window_size
++        self.sliding_window_size = (
++            self.window_left_per_wrapper[0]
++            if attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW
++            else model_runner.sliding_window_size
++        )
+         self.attn_backend = attn_backend
+ 
+         # Buffers and wrappers
+@@ -1355,6 +1474,8 @@
+             seq_lens_cpu,
+             fixed_split_size=fixed_split_size,
+             disable_split_kv=disable_split_kv,
++            num_qo_heads=self.num_qo_heads_per_wrapper[0],
++            window_left=self.window_left_per_wrapper[0],
+         )
+ 
+     def update_sliding_window(
+@@ -1407,6 +1528,8 @@
+                 use_sliding_window_kv_pool=use_sliding_window_kv_pool,
+                 fixed_split_size=fixed_split_size,
+                 disable_split_kv=disable_split_kv,
++                num_qo_heads=self.num_qo_heads_per_wrapper[wrapper_id],
++                window_left=self.window_left_per_wrapper[wrapper_id],
+             )
+ 
+     def update_cross_attention(
+@@ -1446,6 +1569,8 @@
+                 seq_lens_cpu=kv_lens_cpu,
+                 fixed_split_size=fixed_split_size,
+                 disable_split_kv=disable_split_kv,
++                num_qo_heads=self.num_qo_heads_per_wrapper[wrapper_id],
++                window_left=self.window_left_per_wrapper[wrapper_id],
+             )
+ 
+     def call_begin_forward(
+@@ -1458,6 +1583,8 @@
+         kv_start_idx: torch.Tensor,
+         spec_info: Optional[SpecInput],
+         seq_lens_cpu: Optional[torch.Tensor],
++        num_qo_heads: int,
++        window_left: int,
+         use_sliding_window_kv_pool: bool = False,
+         fixed_split_size: Optional[int] = None,
+         disable_split_kv: Optional[bool] = None,
+@@ -1518,12 +1645,13 @@
+                 kv_indptr,
+                 kv_indices,
+                 self.kv_last_page_len[:bs],
+-                self.num_qo_heads,
++                num_qo_heads,
+                 self.num_kv_heads,
+                 self.head_dim,
+                 1,
+                 data_type=self.data_type,
+                 q_data_type=self.q_data_type,
++                window_left=window_left,
+                 non_blocking=True,
+                 fixed_split_size=fixed_split_size,
+                 disable_split_kv=(
+@@ -1537,12 +1665,13 @@
+                 kv_indptr,
+                 kv_indices,
+                 self.kv_last_page_len[:bs],
+-                self.num_qo_heads,
++                num_qo_heads,
+                 self.num_kv_heads,
+                 self.head_dim,
+                 1,
+                 data_type=self.data_type,
+                 q_data_type=self.q_data_type,
++                window_left=window_left,
+                 non_blocking=True,
+                 fixed_split_size=fixed_split_size,
+                 disable_split_kv=(
+@@ -1560,13 +1689,19 @@
+         self.num_qo_heads = (
+             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
+         )
++        self.num_qo_heads_per_wrapper = attn_backend.num_qo_heads_per_wrapper
++        self.window_left_per_wrapper = attn_backend.window_left_per_wrapper
+         self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
+             get_parallel().attn_tp_size
+         )
+         self.head_dim = model_runner.model_config.head_dim
+         self.data_type = model_runner.kv_cache_dtype
+         self.q_data_type = model_runner.dtype
+-        self.sliding_window_size = model_runner.sliding_window_size
++        self.sliding_window_size = (
++            self.window_left_per_wrapper[0]
++            if attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW
++            else model_runner.sliding_window_size
++        )
+         self.attn_backend = attn_backend
+         # Buffers and wrappers
+         self.kv_indptr = attn_backend.kv_indptr
+@@ -1574,7 +1709,7 @@
+         self.qo_indptr = attn_backend.qo_indptr
+         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+         self._swa_kv_pool = attn_backend._swa_kv_pool
+-        self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
++        self.prefill_wrappers_ragged = attn_backend.prefill_wrappers_ragged
+ 
+         # Dispatch the update function
+         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
+@@ -1633,7 +1768,7 @@
+             paged_kernel_lens_sum = seq_lens_sum
+ 
+         self.call_begin_forward(
+-            self.prefill_wrapper_ragged,
++            self.prefill_wrappers_ragged[0],
+             prefill_wrappers[0],
+             req_pool_indices,
+             paged_kernel_lens,
+@@ -1648,6 +1783,12 @@
+             fixed_split_size=fixed_split_size,
+             multi_item_params=multi_item_params,
+             seq_lens_cpu=seq_lens_cpu,
++            num_qo_heads=self.num_qo_heads_per_wrapper[0],
++            window_left=(
++                -1
++                if multi_item_params is not None and multi_item_params.is_enabled()
++                else self.window_left_per_wrapper[0]
++            ),
+         )
+ 
+     def update_sliding_window(
+@@ -1712,7 +1853,7 @@
+             )
+ 
+             self.call_begin_forward(
+-                self.prefill_wrapper_ragged,
++                self.prefill_wrappers_ragged[wrapper_id],
+                 prefill_wrappers[wrapper_id],
+                 req_pool_indices,
+                 paged_kernel_lens,
+@@ -1728,6 +1869,13 @@
+                 fixed_split_size=fixed_split_size,
+                 multi_item_params=multi_item_params,
+                 cross_attention_custom_mask=swa_paged_custom_mask,
++                num_qo_heads=self.num_qo_heads_per_wrapper[wrapper_id],
++                window_left=(
++                    -1
++                    if multi_item_params is not None
++                    and multi_item_params.is_enabled()
++                    else self.window_left_per_wrapper[wrapper_id]
++                ),
+             )
+ 
+     def _build_swa_prefix_custom_mask(
+@@ -1800,7 +1948,7 @@
+                 paged_kernel_lens_sum = paged_kernel_lens.sum().item()
+ 
+             self.call_begin_forward(
+-                self.prefill_wrapper_ragged,
++                self.prefill_wrappers_ragged[wrapper_id],
+                 prefill_wrappers[wrapper_id],
+                 req_pool_indices,
+                 paged_kernel_lens,
+@@ -1817,6 +1965,13 @@
+                 cross_attention_custom_mask=(
+                     cross_attention_custom_mask if wrapper_id == 1 else None
+                 ),
++                num_qo_heads=self.num_qo_heads_per_wrapper[wrapper_id],
++                window_left=(
++                    -1
++                    if multi_item_params is not None
++                    and multi_item_params.is_enabled()
++                    else self.window_left_per_wrapper[wrapper_id]
++                ),
+             )
+ 
+     def call_begin_forward(
+@@ -1833,6 +1988,8 @@
+         qo_indptr: torch.Tensor,
+         use_ragged: bool,
+         spec_info: Optional[SpecInput],
++        num_qo_heads: int,
++        window_left: int,
+         use_sliding_window_kv_pool: bool = False,
+         fixed_split_size: Optional[int] = None,
+         multi_item_params: Optional[MultiItemScoringParams] = None,
+@@ -1891,9 +2048,11 @@
+             wrapper_ragged.begin_forward(
+                 qo_indptr,
+                 qo_indptr,
+-                self.num_qo_heads,
++                num_qo_heads,
+                 self.num_kv_heads,
+                 self.head_dim,
++                causal=False,
++                window_left=window_left,
+                 q_data_type=self.q_data_type,
+             )
+ 
+@@ -1962,13 +2121,15 @@
+             kv_indptr,
+             kv_indices,
+             self.kv_last_page_len[:bs],
+-            self.num_qo_heads,
++            num_qo_heads,
+             self.num_kv_heads,
+             self.head_dim,
+             1,
+             q_data_type=self.q_data_type,
+             kv_data_type=self.data_type,
+             custom_mask=use_custom_mask,
++            causal=False,
++            window_left=window_left,
+             non_blocking=True,
+             fixed_split_size=fixed_split_size,
+             prefix_len_ptr=prefix_len_ptr,
+--- a/python/sglang/srt/models/laguna.py
++++ b/python/sglang/srt/models/laguna.py
+@@ -705,6 +705,9 @@
+     def get_input_embeddings(self) -> nn.Embedding:
+         return self.model.embed_tokens
+ 
++    def get_attention_sliding_window_size(self) -> Optional[int]:
++        return int(self.config.sliding_window) - 1
++
+     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+         stacked_params_mapping = [
+             ("qkv_proj", "q_proj", "q"),

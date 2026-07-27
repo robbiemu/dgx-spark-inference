@@ -1,0 +1,39 @@
+# Experimental agentic capability record. It is deliberately absent from the
+# production runtime catalog until all agentic gates pass on the DGX Spark.
+kind = "model-capability"
+capability_id = "laguna-s-2.1-nvfp4-dflash-agentic-experimental"
+promotion_state = "approved"
+approval_scope = "experimental-laguna-s-2.1-dflash-2026-07-22"
+
+model_id = "laguna-s-2.1-nvfp4-dflash"
+kind_detail = "bundle"
+acceleration_method = "DFLASH"
+roles = ["agentic-experimental"]
+
+capabilities = [
+  "chat_completion",
+  "reasoning",
+  "tool_calling",
+  "multiturn_continuity",
+]
+
+compatible_runtime_ids = ["sglang-main-27906"]
+launch_profile = "laguna-s-2.1-nvfp4-dflash-agentic-experimental"
+
+[target]
+model_id = "laguna-s-2.1-nvfp4"
+source_repository = "poolside/Laguna-S-2.1-NVFP4"
+source_revision = "b482b5d57fda6e4e562a652869bde24ba2a57c92"
+quantization = "nvfp4"
+
+[drafter]
+model_id = "laguna-s-2.1-dflash-nvfp4"
+source_repository = "poolside/Laguna-S-2.1-DFlash-NVFP4"
+source_revision = "723794750422b3efbf3a7b3af76dffb4ba035943"
+precision = "bfloat16"
+
+[known_limitations]
+correctness = "qualified at 32768 tokens with clean target-only/DFlash output-set parity, cached-prefix reuse, tool calls, continuation, and a 1498-token prompt"
+grammar_constrained_structured_output = "unsupported: SGLang DFLASH rejects grammar-constrained requests"
+logprobs = "unsupported: SGLang DFLASH rejects return_logprob requests"
+dgx_spark_fit = "qualified at 32768 tokens on one DGX Spark; 262144 remains unqualified"
