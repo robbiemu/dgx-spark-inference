@@ -55,8 +55,14 @@ MODEL_CACHE_ROOT="${MODEL_CACHE_ROOT:?MODEL_CACHE_ROOT is required (export it, o
 PORT="${PORT:-30000}"
 CONTAINER_NAME="${CONTAINER_NAME:-inference-agentic}"
 
-# Runtime config dir is on tmpfs; the YAML is rendered 0600 root:root here.
-RUNTIME_CONFIG_DIR="/run/${CONTAINER_NAME}"
+# Production uses root-owned tmpfs under /run. Experimental callers may supply a
+# private user-owned runtime directory because they intentionally run without
+# systemd/root; the launcher removes it on exit.
+if [ "${DGX_INFERENCE_EXPERIMENTAL:-0}" = "1" ]; then
+  RUNTIME_CONFIG_DIR="${DGX_RUNTIME_CONFIG_DIR:-${XDG_RUNTIME_DIR:-/tmp}/${CONTAINER_NAME}-${UID}}"
+else
+  RUNTIME_CONFIG_DIR="/run/${CONTAINER_NAME}"
+fi
 RUNTIME_CONFIG_HOST="${RUNTIME_CONFIG_DIR}/sglang.yaml"
 RUNTIME_CONFIG_CONTAINER="/etc/sglang-runtime/sglang.yaml"
 # SPEC may be relative (resolved against PROJECT_ROOT, the normal case) or
@@ -128,6 +134,13 @@ resolve_model_dir() {  # resolve_model_dir <spec> <cache_root> <container_cache_
 MANIFEST="$RUNTIME_ROOT/runtime-manifest.toml"
 IMAGE="$(toml_get "$MANIFEST" image)"
 EXPECTED_IMAGE_ID="$(toml_get "$MANIFEST" image_id)"
+# Experimental runs may select a separately pinned reproduction image without
+# mutating the production manifest. Both values are required as a pair.
+if [ "${DGX_INFERENCE_EXPERIMENTAL:-0}" = "1" ] && [ -n "${DGX_RUNTIME_IMAGE:-}" ]; then
+  [ -n "${DGX_RUNTIME_IMAGE_ID:-}" ] || { echo "REFUSING: DGX_RUNTIME_IMAGE_ID is required with DGX_RUNTIME_IMAGE" >&2; exit 1; }
+  IMAGE="$DGX_RUNTIME_IMAGE"
+  EXPECTED_IMAGE_ID="$DGX_RUNTIME_IMAGE_ID"
+fi
 HOST_BIND="$(toml_get "$MANIFEST" common_launch.host_bind)"
 CACHE_ROOT="$(toml_get "$MANIFEST" common_launch.container_cache_root)"
 
@@ -167,10 +180,18 @@ emit_yaml() {
     printf '%s\n' "$out"
     return
   fi
-  install -d -o root -g root -m 0700 "$RUNTIME_CONFIG_DIR"
+  if [ "${DGX_INFERENCE_EXPERIMENTAL:-0}" = "1" ]; then
+    install -d -m 0700 "$RUNTIME_CONFIG_DIR"
+  else
+    install -d -o root -g root -m 0700 "$RUNTIME_CONFIG_DIR"
+  fi
   local tmp="${RUNTIME_CONFIG_HOST}.tmp.$$"
   printf '%s\n' "$out" > "$tmp"
-  install -o root -g root -m 0600 "$tmp" "$RUNTIME_CONFIG_HOST"
+  if [ "${DGX_INFERENCE_EXPERIMENTAL:-0}" = "1" ]; then
+    install -m 0600 "$tmp" "$RUNTIME_CONFIG_HOST"
+  else
+    install -o root -g root -m 0600 "$tmp" "$RUNTIME_CONFIG_HOST"
+  fi
   rm -f "$tmp"
 }
 

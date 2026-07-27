@@ -72,7 +72,10 @@ python3 tests/test_measure_model_budget.py || fail=1
 python3 tests/test_fraction_base_validation.py || fail=1
 python3 tests/test_adapter_precedence.py || fail=1
 
-say "Test 14 — authenticated endpoint validator parses"
+say "Test 14 — managed model profiles use pinned standard-cache snapshots"
+python3 tests/test_managed_profiles_use_hf_cache.py || fail=1
+
+say "Test 15 — authenticated endpoint validator parses"
 python3 -m py_compile tools/validate_agentic_endpoint.py || fail=1
 
 say "Repository-wide contextual secret scan"
