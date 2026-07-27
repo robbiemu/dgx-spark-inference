@@ -32,7 +32,6 @@ quantization      = "fp8"
 context_length       = 262144
 max_running_requests = 1
 max_queued_requests  = 1
-attention_backend    = "auto"   # = no override; sglang auto-selects on GB10
 mem_fraction_static  = 0.60    # MEASURED value for this exact config (ctx=262144,
                                # 1/1 pool). Not KV-only: this is the static allocation
                                # TARGET; the realized KV pool is also constrained by
