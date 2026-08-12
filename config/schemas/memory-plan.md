@@ -13,9 +13,10 @@ static fraction or enumerated residency sets).
 
 #
 # For measuring new profiles step-by-step, see docs/measure-model-budget.md.
-The planner turns a per-model **budget ledger** + the complete configured model
-topology into the two launch knobs SGLang needs and runs two admission gates.
-It is stdlib-only, no GPU.
+The planner turns a per-model **budget ledger** + the complete configured
+N-slot model topology into two **per-slot** launch knobs
+(`mem_fraction_static` and `max_total_tokens`) and runs two admission gates for
+every admitted slot. It is stdlib-only, no GPU.
 
 ## Budget ledger — `budget_ledger.toml`
 
@@ -55,6 +56,11 @@ setting: an explicit numeric `max_mamba_cache_size` is recorded in
 `fixed_mamba_cache_gib`; ratio-based automatic sizing is recorded in
 `mamba_kv_memory_ratio`, allowing the planner to recalculate it for every pool.
 
+SGLang's "Mamba cache" name also covers recurrent state used by hybrid linear-
+attention implementations such as GDN/KDA; the ledger field follows that
+runtime vocabulary rather than limiting support to models whose architecture
+name contains "Mamba".
+
 > **Do not** fold `cuda_graph_peak_gib` / `request_workspace_gib` into the
 > fraction numerator (via static_overhead or otherwise). Putting transient graph
 > memory into the fraction makes SGLang enlarge the static KV reservation and
@@ -62,6 +68,24 @@ setting: an explicit numeric `max_mamba_cache_size` is recorded in
 > **admission check**, not the static budget. `static_overhead_gib` is for
 > overhead that SGLang reserves *into* the static budget itself (the allocator's
 > non-linear behavior for large models), which is a different thing.
+
+### Scalable auxiliary pools and schema roadmap
+
+The current schema has one explicitly proportional auxiliary pool:
+`mamba_kv_memory_ratio`. That is the only such pool enabled and measured in the
+supported launch path, not a claim that it is the only pool SGLang can allocate.
+Optional features can introduce other scaling bases, including hierarchical
+host cache sized from the device pool, int8 recurrent-state checkpoints sized
+from active state slots, and speculative-decoding intermediate state sized from
+request concurrency and draft length.
+
+Until one of those features is measured, an enrolled profile must either carry
+its bounded worst case as an appropriate fixed/transient reservation or leave
+the feature disabled. It must not be hidden in `mamba_kv_memory_ratio` merely
+because it grows. The intended schema extension is a list of named scalable
+pools, each declaring its scaling basis and measured bytes per unit; the
+floor-fit and water-fill calculations can then sum every pool without adding
+another architecture-specific branch.
 
 ## Configured topology and host policy
 
