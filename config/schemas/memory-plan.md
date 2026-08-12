@@ -13,9 +13,10 @@ static fraction or enumerated residency sets).
 
 #
 # For measuring new profiles step-by-step, see docs/measure-model-budget.md.
-The planner turns a per-model **budget ledger** + a **residency plan** into the
-two launch knobs SGLang needs and runs two admission gates. It is stdlib-only,
-no GPU.
+The planner turns a per-model **budget ledger** + the complete configured
+N-slot model topology into two **per-slot** launch knobs
+(`mem_fraction_static` and `max_total_tokens`) and runs two admission gates for
+every admitted slot. It is stdlib-only, no GPU.
 
 ## Budget ledger — `budget_ledger.toml`
 
@@ -24,12 +25,21 @@ plain string, not a TOML table path). Required `[profiles.budget]` fields:
 
 - `model_id`
 - `weights_gib` — measured cold-load persistent delta
-- `target_kv_tokens` — the **measured realized pool** (the target the cap pins)
 - `kv_bytes_per_token` — **measured per profile, not a timeless constant** (KV
   dtype, attention layout, TP, MTP/speculative config, and SGLang version can
   alter realized pool bytes; re-measure if any change)
 - `static_overhead_gib` — the empirically-reserved-but-unaccounted portion of a
   model's measured fraction that is **not** weights + KV pool (see note below)
+- `mamba_kv_memory_ratio` — for hybrid allocators, proportional Mamba/linear
+  state GiB per ordinary-KV GiB. This is deliberately separate from fixed
+  overhead because it changes when the planned token pool changes.
+- `fixed_mamba_cache_gib` — Mamba state held constant by an explicit
+  `max_mamba_cache_size`; unlike the ratio field, this does not grow with KV.
+- `minimum_admissible_pool_tokens` — hard per-slot floor.
+- `target_kv_tokens` — expected-demand setting used to derive proportional
+  total-token weights.
+- `maximum_useful_pool_tokens` — hard allocation ceiling, normally
+  `context_length × max_running_requests` from the launch configuration.
 - `cuda_graph_peak_gib`, `request_workspace_gib` — transient peak (graph capture
   beyond the static budget; per-request activations)
 - `static_pad_gib`, `gpu_headroom_gib` — alignment/allocator cushions
@@ -38,17 +48,18 @@ runtime-path calibration (not a model-intrinsic property) determining which
 base the resolver derives mem_fraction_static against. Calibrate by comparing
 predicted versus realized pool sizes; see docs/measure-model-budget.md.
 
-### `static_overhead_gib` — the large-model asymmetry (important)
+### Fixed overhead versus proportional Mamba state
 
-For large models (e.g. the 27B primary), CUDA-graph capture and hybrid-attention
-state are reserved **into** the static budget. The primary's measured
-`mem_fraction_static=0.60` therefore includes ~21 GiB of overhead beyond
-`weights + kv`, so the clean component sum derives only `~0.42`. `static_overhead_gib`
-captures that measured gap so the **derived** fraction reproduces the
-**measured** one. It is **measured, not computed**; record per profile.
+`static_overhead_gib` is only the measured residual that does not vary with the
+planned token pool. Hybrid state must be classified from the actual allocator
+setting: an explicit numeric `max_mamba_cache_size` is recorded in
+`fixed_mamba_cache_gib`; ratio-based automatic sizing is recorded in
+`mamba_kv_memory_ratio`, allowing the planner to recalculate it for every pool.
 
-The helper (9B, pool-dominated) needs none — its `0.80` reproduces from
-components alone. That asymmetry is real and model-size-dependent.
+SGLang's "Mamba cache" name also covers recurrent state used by hybrid linear-
+attention implementations such as GDN/KDA; the ledger field follows that
+runtime vocabulary rather than limiting support to models whose architecture
+name contains "Mamba".
 
 > **Do not** fold `cuda_graph_peak_gib` / `request_workspace_gib` into the
 > fraction numerator (via static_overhead or otherwise). Putting transient graph
@@ -58,19 +69,79 @@ components alone. That asymmetry is real and model-size-dependent.
 > overhead that SGLang reserves *into* the static budget itself (the allocator's
 > non-linear behavior for large models), which is a different thing.
 
-## Residency plan — `plan_*.toml`
+### Scalable auxiliary pools and schema roadmap
+
+The current schema has one explicitly proportional auxiliary pool:
+`mamba_kv_memory_ratio`. That is the only such pool enabled and measured in the
+supported launch path, not a claim that it is the only pool SGLang can allocate.
+Optional features can introduce other scaling bases, including hierarchical
+host cache sized from the device pool, int8 recurrent-state checkpoints sized
+from active state slots, and speculative-decoding intermediate state sized from
+request concurrency and draft length.
+
+Until one of those features is measured, an enrolled profile must either carry
+its bounded worst case as an appropriate fixed/transient reservation or leave
+the feature disabled. It must not be hidden in `mamba_kv_memory_ratio` merely
+because it grows. The intended schema extension is a list of named scalable
+pools, each declaring its scaling basis and measured bytes per unit; the
+floor-fit and water-fill calculations can then sum every pool without adding
+another architecture-specific branch.
+
+## Configured topology and host policy
+
+On the live path, `active-models.toml` is the authoritative topology. Every
+`[active.<role>]` entry contributes its configured `model_id` to one joint
+calculation; the implementation does not assume a role name or a model count.
+`memory_plan.toml` supplies host policy such as the system memory floor.
+
+The resolver's standalone input also accepts:
 
 - `device.total_gib` — device total (SGLang's view; GB10 ≈ 121.7)
-- `observed.memavailable_now_gib` — host MemAvailable **at plan time**, reflecting
-  any already-resident models
-- `[policy]` — host-wide policy (see below)
-- `[[resident]]` — models already up (peak already consumed; not re-gated)
-- `[[admit]]` — models to load now (`role` + `model_id`), in load order
+- `observed.gpu_free_now_gib` and `observed.memavailable_now_gib` — cold live
+  measurements
+- `[policy].allocation_mode = "floor_weighted"`
+- one `[[admit]]` per configured role/model
+
+`fixed_targets` remains available for a single launch-time gate with an
+already-chosen `allocated_kv_tokens`; it is how the wrapper turns one persisted
+joint allocation into a fraction against that model's actual `A_preload`.
+
+### Floor-first allocation
+
+For every configured slot `i`:
+
+```text
+floor_tokens_i  = minimum_admissible_pool_tokens_i
+raw_weight_i    = target_kv_tokens_i / floor_tokens_i
+total_weight_i  = raw_weight_i / min(raw_weight)
+```
+
+The planner first reserves all weights, fixed overhead, fixed Mamba state,
+floor KV, proportional Mamba state, pads, graph/workspace transients, GPU
+headroom, and the system `MemAvailable` floor. If the complete set of floors
+cannot fit, it refuses the entire cold plan before any model launches.
+
+It then performs a bounded weighted water-fill over **total token pools**, not
+over increments above each floor. A slot below its proportional share catches
+up first; after that, total pools maintain the configured relationship. Token
+counts are converted to bytes separately for every model. For
+example, configured values of `512K/256K` and `1024K/256K` derive raw weights
+`2` and `4`, normalized to a 1:2 **total-pool** relationship; that relationship
+is not encoded by role. Different KV costs mean a token-weighted ratio is
+intentionally not a raw-GiB ratio. Once a slot reaches its configured useful
+ceiling, additional memory is redistributed among uncapped slots. If every
+slot reaches its ceiling, the remainder stays free.
 
 ### `[policy]` — host-wide tunables
 
 - `memavailable_floor_gib` — the **hard refusal line**: the planner refuses to
   admit a model whose load would push system MemAvailable below this.
+- `reclaim_page_cache_before_probe` — optional boolean host policy for unified-
+  memory systems such as GB10. When `true`, serialized admission runs `sync`
+  and asks Linux to discard clean file-backed page cache before sampling CUDA
+  free memory. This reconciles `torch.cuda.mem_get_info()` (immediately free
+  pages) with `MemAvailable` (free plus safely reclaimable pages). It is off by
+  default because discrete-GPU hosts do not need host page-cache reclamation.
 
 **Layering** (authoritative → fallback): `DGX_MEMAVAILABLE_FLOOR_GIB` (env override)
 > installed `memory_plan.toml [policy]` > built-in default `6.0`. Enforced on the
@@ -104,6 +175,11 @@ subtracted again (they're for identity/revision/guard checks only). A GPU-probe
 failure REFUSES in both auto and required modes once a pair exists — the resolver
 must never derive a fraction from a synthetic/invented A_preload.
 
+On a unified-memory host with `reclaim_page_cache_before_probe = true`, the live
+probe occurs after clean page cache is reclaimed under the same serialized lock.
+The probe remains real; the policy only makes reclaimable physical pages visible
+to CUDA before the measurement.
+
 A model that fails either gate is refused **before the GPU is touched**. A failed
 slot does not reduce the running counters for subsequent slots (one bad record
 cannot cascade a false fit). The dispatcher emits, per admitted model:
@@ -126,13 +202,21 @@ signals a half-edited deployment; never silently pair it with a repo copy of the
 other, which could be from a different schema generation).
 
 **Serialized admission (the race fix).** `flock` on `/run/dgx-inference-admission.lock`
-spans discover → sample → resolve → launch → **verify realized allocation via
+spans discover → sample → resolve/reuse the joint allocation → launch → **verify realized allocation via
 `/get_server_info`** (carrying the API key) → release. The adapter child is
 launched with the lock fd closed (so a long-lived adapter cannot hold the lock
 and deadlock co-residents). Two concurrent dispatchers cannot both pass while the
 first candidate is between preflight and allocation commitment. After verified
 admission, the wrapper execs into supervising the adapter (Type=simple requires
 the tracked PID to stay alive).
+
+On a cold start, the wrapper hashes the ledger, active topology, and host policy,
+resolves all configured slots together, and atomically persists the allocation
+under `/run/dgx-inference-memory-plan.json`. Subsequent serialized role launches
+must match that revision and reuse their role+model allocation. If managed
+residents exist but the state is missing or stale, admission refuses and
+requires a coordinated cold reload rather than silently replanning around a
+partial topology.
 
 **Refusal exit code 75** (EX_TEMPFAIL): a deliberate admission refusal. The unit's
 `StartLimitBurst=3`/`StartLimitIntervalSec=300` bounds any restart churn (no

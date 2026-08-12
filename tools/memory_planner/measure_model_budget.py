@@ -118,7 +118,7 @@ class Measurement:
         kv_lines = _find_all(r"KV Cache is allocated\.", lines)
         if not kv_lines:
             self.warn("no 'KV Cache is allocated.' lines — pool fields will be 0")
-            self.record("target_kv_tokens", 0, "(no KV cache line)")
+            self.record("measured_kv_tokens", 0, "(no KV cache line)")
             self.record("kv_bytes_per_token", 0.0, "(no KV cache line)")
             return 0, 0.0
         # Take the pool with the most tokens (primary > draft for MTP)
@@ -143,7 +143,7 @@ class Measurement:
         # Note: main() checks pool count and refuses on multiple pools.
         # This method still returns the largest for the trace, but the TOML
         # is never emitted when pool_count > 1.
-        self.record("target_kv_tokens", best_tokens, best_line[:120])
+        self.record("measured_kv_tokens", best_tokens, best_line[:120])
         self.record("kv_bytes_per_token", round(kv_bytes, 1), f"({best_k}+{best_v}) GiB / {best_tokens} tokens")
         return best_tokens, kv_bytes
 
@@ -159,6 +159,46 @@ class Measurement:
         total = sum(float(s) for s in sizes) if sizes else 0.0
         self.record("mamba_cache_gib", round(total, 2), mamba_line.strip()[:120])
         return total
+
+    def measure_mamba_allocator(
+        self, lines: list[str]
+    ) -> tuple[Optional[str], Optional[float]]:
+        """Return (fixed|proportional|None, configured ratio if visible)."""
+        # The allocation line reports the *realized* slot count even when the
+        # configured max was None. Only configuration/server-argument lines can
+        # distinguish a fixed cap from ratio-based auto-sizing.
+        text = "\n".join(
+            line for line in lines if "Mamba Cache is allocated." not in line
+        )
+        maximum = re.search(
+            r"\bmax_mamba_cache_size['\"]?\s*[:=]\s*(None|null|[0-9]+)",
+            text,
+            re.IGNORECASE,
+        )
+        ratio = re.search(
+            r"\bmamba_full_memory_ratio['\"]?\s*[:=]\s*([0-9.]+)",
+            text,
+        )
+        configured_ratio = float(ratio.group(1)) if ratio else None
+        if not maximum:
+            return None, configured_ratio
+        value = maximum.group(1)
+        if value.lower() in {"none", "null"}:
+            mode = "proportional"
+        else:
+            mode = "fixed"
+        self.record(
+            "mamba_cache_allocation",
+            mode,
+            f"max_mamba_cache_size={value}",
+        )
+        if configured_ratio is not None:
+            self.record(
+                "configured_mamba_kv_ratio",
+                configured_ratio,
+                "mamba_full_memory_ratio from server arguments",
+            )
+        return mode, configured_ratio
 
     # -- cuda_graph_peak_gib: sum of "Capture ... end" mem usage deltas ------
 
@@ -201,14 +241,16 @@ class Measurement:
     def compute_static_overhead(
         self, mem_fraction: float, base_value: float, base_name: str,
         weights: float, kv_tokens: int, kv_bytes: float,
-        static_pad: float, mamba_cache: float,
+        static_pad: float, fixed_mamba_cache: float,
+        mamba_kv_memory_ratio: float,
     ) -> float:
         if base_value <= 0 or kv_tokens <= 0:
             self.record("static_overhead_gib", 0.0, f"(cannot compute: missing {base_name} or pool)")
             return 0.0
         kv_gib = (kv_tokens * kv_bytes) / GIB
+        mamba_gib = kv_gib * mamba_kv_memory_ratio
         budget = mem_fraction * base_value  # what the fraction reserved
-        components = weights + kv_gib + static_pad
+        components = weights + kv_gib + fixed_mamba_cache + mamba_gib + static_pad
         overhead = budget - components
         if overhead < 0:
             self.warn(
@@ -217,16 +259,15 @@ class Measurement:
                 f"The mem_fraction may be too low, or this profile is pool-dominated "
                 f"(set static_overhead_gib = 0)."
             )
-        # Include Mamba cache in the overhead (it's reserved into the static budget
-        # for hybrid models, not a separate line item in the ledger schema).
-        overhead_incl_mamba = overhead  # overhead already reflects total reservation
         self.record(
             "static_overhead_gib",
-            round(max(overhead_incl_mamba, 0.0), 2),
-            f"({mem_fraction} × {base_value:.2f} [{base_name}]) - ({weights:.2f} + {kv_gib:.2f} + {static_pad})"
-            + (f" [includes ~{mamba_cache:.2f} GiB Mamba state]" if mamba_cache > 0 else ""),
+            round(max(overhead, 0.0), 2),
+            f"({mem_fraction} × {base_value:.2f} [{base_name}]) - "
+            f"({weights:.2f} weights + {kv_gib:.2f} KV + "
+            f"{fixed_mamba_cache:.2f} fixed Mamba + "
+            f"{mamba_gib:.2f} proportional Mamba + {static_pad} pad)",
         )
-        return max(overhead_incl_mamba, 0.0)
+        return max(overhead, 0.0)
 
     # -- available_gpu_mem: from the max_total_num_tokens line --------------
 
@@ -260,6 +301,7 @@ def emit_profile(
     model_id: str,
     weights: float,
     kv_tokens: int,
+    target_tokens: int,
     kv_bytes: float,
     static_overhead: float,
     cuda_graph_peak: float,
@@ -267,7 +309,10 @@ def emit_profile(
     request_workspace: float,
     gpu_headroom: float,
     minimum_pool: int,
+    maximum_pool: int,
     context_length: int,
+    fixed_mamba_cache: float = 0.0,
+    mamba_kv_memory_ratio: float = 0.0,
     fraction_base: str = "a_preload",
 ) -> str:
     """Emit a [[profiles]] TOML block ready to append to budget_ledger.toml."""
@@ -280,13 +325,19 @@ def emit_profile(
         lines.append(f"# context_length={context_length}, measured pool={kv_tokens}")
     lines.append("[profiles.budget]")
     lines.append(f"weights_gib            = {weights:.2f}")
-    lines.append(f"target_kv_tokens       = {kv_tokens}")
+    lines.append(f"target_kv_tokens       = {target_tokens}")
     if minimum_pool > 0:
         lines.append(f"minimum_admissible_pool_tokens = {minimum_pool}   # role contract floor")
+    if maximum_pool > 0:
+        lines.append(f"maximum_useful_pool_tokens = {maximum_pool}")
     lines.append(f"kv_bytes_per_token     = {kv_bytes:.1f}")
     lines.append(f"static_pad_gib         = {static_pad}")
     if static_overhead > 0:
         lines.append(f"static_overhead_gib    = {static_overhead:.2f}")
+    if fixed_mamba_cache > 0:
+        lines.append(f"fixed_mamba_cache_gib = {fixed_mamba_cache:.2f}")
+    if mamba_kv_memory_ratio > 0:
+        lines.append(f"mamba_kv_memory_ratio = {mamba_kv_memory_ratio:.6f}")
     lines.append(f"cuda_graph_peak_gib    = {cuda_graph_peak:.2f}")
     lines.append(f"request_workspace_gib  = {request_workspace}")
     lines.append(f"gpu_headroom_gib       = {gpu_headroom}")
@@ -313,12 +364,43 @@ def main() -> int:
                     help="context_length (for the entry comment; auto-detected if omitted)")
     ap.add_argument("--minimum-pool", type=int, default=0,
                     help="minimum admissible pool tokens (role contract floor; 0 = unenforced)")
+    ap.add_argument(
+        "--target-pool",
+        type=int,
+        default=None,
+        help="configured expected-demand pool (default: measured realized pool)",
+    )
+    ap.add_argument(
+        "--maximum-useful-pool",
+        type=int,
+        default=0,
+        help="hard useful ceiling, normally context_length * max_running_requests",
+    )
     ap.add_argument("--static-pad", type=float, default=0.5,
                     help="static_pad_gib (default: 0.5)")
     ap.add_argument("--request-workspace", type=float, default=2.0,
                     help="request_workspace_gib (default: 2.0)")
     ap.add_argument("--gpu-headroom", type=float, default=1.0,
                     help="gpu_headroom_gib (default: 1.0)")
+    ap.add_argument(
+        "--mamba-kv-memory-ratio",
+        type=float,
+        default=None,
+        help=(
+            "Mamba-state GiB per ordinary-KV GiB for proportional allocation. "
+            "The configured server ratio is preferred when visible in the log."
+        ),
+    )
+    ap.add_argument(
+        "--mamba-cache-allocation",
+        choices=["auto", "fixed", "proportional"],
+        default="auto",
+        help=(
+            "whether Mamba state is fixed by max_mamba_cache_size or scales "
+            "with KV (default: detect from server arguments; ambiguous hybrid "
+            "logs are refused)"
+        ),
+    )
     ap.add_argument("--fraction-base", choices=["a_preload", "device_total"], default="a_preload",
                     help="which base the measured mem_fraction was applied against "
                          "(default: a_preload). Use device_total when sglang applies "
@@ -330,6 +412,21 @@ def main() -> int:
     # Validate mem_fraction (must be a valid fraction: >0, <=1)
     if not (0 < args.mem_fraction <= 1):
         print(f"REFUSE: --mem-fraction must be in (0, 1], got {args.mem_fraction}", file=sys.stderr)
+        return 2
+    if args.target_pool is not None and args.target_pool <= 0:
+        print("REFUSE: --target-pool must be > 0.", file=sys.stderr)
+        return 2
+    if args.maximum_useful_pool < 0:
+        print("REFUSE: --maximum-useful-pool must be >= 0.", file=sys.stderr)
+        return 2
+    if (
+        args.maximum_useful_pool > 0
+        and args.minimum_pool > args.maximum_useful_pool
+    ):
+        print(
+            "REFUSE: --minimum-pool exceeds --maximum-useful-pool.",
+            file=sys.stderr,
+        )
         return 2
 
     # Validate fraction_base / device_total consistency
@@ -363,6 +460,7 @@ def main() -> int:
     weights = m.measure_weights(lines)
     kv_tokens, kv_bytes = m.measure_kv_pool(lines)
     mamba_cache = m.measure_mamba_cache(lines)
+    detected_mamba_mode, configured_mamba_ratio = m.measure_mamba_allocator(lines)
     graph_peak = m.measure_graph_peak(lines)
     a_preload = m.measure_a_preload(lines)
     avail_post = m.measure_available_gpu_mem(lines)
@@ -374,10 +472,79 @@ def main() -> int:
     else:
         base_value = a_preload
         base_name = "a_preload"
+    if args.mamba_kv_memory_ratio is not None and args.mamba_kv_memory_ratio < 0:
+        print(
+            "REFUSE: --mamba-kv-memory-ratio must be >= 0.",
+            file=sys.stderr,
+        )
+        return 2
+
+    requested_mamba_mode = args.mamba_cache_allocation
+    if mamba_cache <= 0:
+        mamba_mode = "fixed"
+    elif requested_mamba_mode != "auto":
+        mamba_mode = requested_mamba_mode
+    elif args.mamba_kv_memory_ratio is not None:
+        mamba_mode = "proportional"
+    elif detected_mamba_mode is not None:
+        mamba_mode = detected_mamba_mode
+    else:
+        print(
+            "REFUSE: hybrid log does not reveal whether max_mamba_cache_size "
+            "is fixed or None. Pass --mamba-cache-allocation fixed or "
+            "proportional; guessing would make pool scaling unsafe.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if mamba_mode == "fixed":
+        if args.mamba_kv_memory_ratio not in (None, 0.0):
+            print(
+                "REFUSE: a nonzero --mamba-kv-memory-ratio conflicts with "
+                "--mamba-cache-allocation=fixed.",
+                file=sys.stderr,
+            )
+            return 2
+        fixed_mamba_cache = mamba_cache
+        mamba_kv_memory_ratio = 0.0
+        if fixed_mamba_cache > 0:
+            m.record(
+                "fixed_mamba_cache_gib",
+                round(fixed_mamba_cache, 2),
+                "explicit max_mamba_cache_size keeps this allocation fixed",
+            )
+    else:
+        fixed_mamba_cache = 0.0
+        measured_kv_gib = (
+            (kv_tokens * kv_bytes) / GIB if kv_tokens > 0 else 0.0
+        )
+        if args.mamba_kv_memory_ratio is not None:
+            mamba_kv_memory_ratio = args.mamba_kv_memory_ratio
+            ratio_source = "operator-supplied runtime allocator ratio"
+        elif configured_mamba_ratio is not None:
+            mamba_kv_memory_ratio = configured_mamba_ratio
+            ratio_source = "mamba_full_memory_ratio from server arguments"
+        elif mamba_cache > 0 and measured_kv_gib > 0:
+            mamba_kv_memory_ratio = mamba_cache / measured_kv_gib
+            ratio_source = (
+                f"{mamba_cache:.2f} GiB measured Mamba / "
+                f"{measured_kv_gib:.2f} GiB measured KV"
+            )
+        else:
+            print(
+                "REFUSE: proportional Mamba allocation has no usable ratio.",
+                file=sys.stderr,
+            )
+            return 2
+        m.record(
+            "mamba_kv_memory_ratio",
+            round(mamba_kv_memory_ratio, 6),
+            ratio_source,
+        )
     static_overhead = m.compute_static_overhead(
         args.mem_fraction, base_value, base_name,
         weights, kv_tokens, kv_bytes,
-        args.static_pad, mamba_cache,
+        args.static_pad, fixed_mamba_cache, mamba_kv_memory_ratio,
     )
 
     # Hard-stop checks: refuse to emit TOML if the measurement is not ledger-ready.
@@ -441,6 +608,7 @@ def main() -> int:
         model_id=args.model_id,
         weights=weights,
         kv_tokens=kv_tokens,
+        target_tokens=args.target_pool or kv_tokens,
         kv_bytes=kv_bytes,
         static_overhead=static_overhead,
         cuda_graph_peak=graph_peak,
@@ -448,7 +616,10 @@ def main() -> int:
         request_workspace=args.request_workspace,
         gpu_headroom=args.gpu_headroom,
         minimum_pool=args.minimum_pool,
+        maximum_pool=args.maximum_useful_pool,
         context_length=ctx,
+        fixed_mamba_cache=fixed_mamba_cache,
+        mamba_kv_memory_ratio=mamba_kv_memory_ratio,
         fraction_base=args.fraction_base,
     )
     print(toml)

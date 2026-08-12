@@ -50,15 +50,24 @@ export ROLE PORT CONTAINER_NAME
 PLANNER="${DGX_MEMORY_PLANNER:-$PROJECT_ROOT/tools/memory_planner/resolve_memory_plan.py}"
 LEDGER="${DGX_MEMORY_LEDGER:-$CONFIG_ROOT/memory_ledger.toml}"
 PLAN="${DGX_MEMORY_PLAN:-$CONFIG_ROOT/memory_plan.toml}"
+ACTIVE_MODELS="${ACTIVE_MODELS:-$CONFIG_ROOT/active-models.toml}"
 PREFLIGHT="${DGX_MEMORY_PREFLIGHT:-auto}"   # auto | required | off
 # FLOOR is resolved AFTER the pair check (Blocker 3): layered
 #   DGX_MEMAVAILABLE_FLOOR_GIB (env) > installed memory_plan.toml [policy] > default 6.0
 LOCK="${DGX_ADMISSION_LOCK:-/run/dgx-inference-admission.lock}"
+JOINT_STATE="${DGX_MEMORY_PLAN_STATE:-/run/dgx-inference-memory-plan.json}"
+DROP_CACHES_PATH="${DGX_DROP_CACHES_PATH:-/proc/sys/vm/drop_caches}"
 PORT="${PORT:-30000}"
-ADMISSION_READY_TIMEOUT="${DGX_ADMISSION_READY_TIMEOUT:-300}"  # sec to verify allocation
+ADMISSION_READY_TIMEOUT="${DGX_ADMISSION_READY_TIMEOUT:-900}"  # sec to verify allocation
 
 die() { echo "ERROR: REFUSING: $*" >&2; exit 75; }   # 75 = deliberate refusal (EX_TEMPFAIL)
 log() { echo "[admission] $*"; }
+
+case "$ADMISSION_READY_TIMEOUT" in
+  ''|*[!0-9]*) die "DGX_ADMISSION_READY_TIMEOUT must be a positive integer" ;;
+esac
+[ "$ADMISSION_READY_TIMEOUT" -gt 0 ] \
+  || die "DGX_ADMISSION_READY_TIMEOUT must be a positive integer"
 
 # ---- enrollment: decide whether to run the preflight at all ----------------
 # auto  : run only if a matched planner pair exists in CONFIG_ROOT; else legacy.
@@ -94,6 +103,22 @@ if [ "$has_pair" = "0" ]; then
 fi
 
 [ -x "$PLANNER" ] || [ -f "$PLANNER" ] || die "planner not found: $PLANNER"
+[ -f "$ACTIVE_MODELS" ] || die "managed mode: active-models topology missing: $ACTIVE_MODELS"
+
+# The caller must be exactly one of the configured active slots.  The joint
+# planner reads every slot from this same file; no role count or role name is
+# embedded in the allocator.
+python3 - "$ACTIVE_MODELS" "$ROLE" "$MODEL_ID" <<'PY' \
+  || die "caller '$ROLE/$MODEL_ID' does not match active-models topology"
+import sys, tomllib
+path, role, model = sys.argv[1:4]
+active = tomllib.load(open(path, "rb")).get("active", {})
+slot = active.get(role)
+if not isinstance(slot, dict) or slot.get("model_id") != model:
+    sys.exit(1)
+if not active:
+    sys.exit(1)
+PY
 
 # ---- resolve the MemAvailable floor (Blocker 3: layered, honors installed plan) -
 # Layering: DGX_MEMAVAILABLE_FLOOR_GIB (env override) > installed memory_plan.toml
@@ -128,6 +153,36 @@ FLOOR="$(resolve_floor)"
 python3 -c "f=float('$FLOOR'); assert f==f and f>0" 2>/dev/null \
   || die "resolved memavailable_floor_gib is not a finite positive number: '$FLOOR'"
 
+# GB10 uses one physical memory pool for Linux and CUDA. Loading a model also
+# populates clean file-backed page cache (checkpoint shards, container layers,
+# shared libraries). MemAvailable counts those pages as reclaimable, while
+# torch.cuda.mem_get_info() reports only immediately free pages. Without an
+# explicit reclaim between serialized launches, the CUDA probe can therefore
+# report only a few GiB even though tens of GiB are safely reclaimable, and a
+# valid co-resident model is refused before it reaches Docker.
+#
+# This is an explicit host policy because dropping the host page cache is not
+# appropriate on every CUDA system. It is performed under the admission lock,
+# before every live probe, so both the cold joint plan and later fractions use
+# the same reclaimable-memory view. The Linux MemAvailable floor remains the
+# hard safety gate after reclaim.
+resolve_page_cache_reclaim() {
+  python3 - "$PLAN" <<'PY'
+import sys, tomllib
+try:
+    value = tomllib.load(open(sys.argv[1], "rb")).get("policy", {}).get(
+        "reclaim_page_cache_before_probe", False
+    )
+except Exception:
+    raise SystemExit(1)
+if not isinstance(value, bool):
+    raise SystemExit(2)
+print("true" if value else "false")
+PY
+}
+RECLAIM_PAGE_CACHE="$(resolve_page_cache_reclaim)" \
+  || die "memory plan has invalid policy.reclaim_page_cache_before_probe (must be true or false)"
+
 # ---- the serialized admission lock -----------------------------------------
 # Hold across discover->sample->resolve->launch->VERIFY. flock is released when
 # the holding fd closes (on exec-via-wait or exit). We open it on fd 9.
@@ -136,22 +191,61 @@ log "acquiring admission lock ($LOCK)..."
 flock 9
 log "lock held"
 
+if [ "$RECLAIM_PAGE_CACHE" = "true" ]; then
+  memfree_before_kib="$(awk '/^MemFree:/ {print $2}' /proc/meminfo)"
+  memavail_before_kib="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
+  sync
+  printf '3\n' > "$DROP_CACHES_PATH" \
+    || die "cannot reclaim page cache through $DROP_CACHES_PATH"
+  memfree_after_kib="$(awk '/^MemFree:/ {print $2}' /proc/meminfo)"
+  log "reclaimed clean page cache before GPU probe (MemFree ${memfree_before_kib}KiB -> ${memfree_after_kib}KiB; MemAvailable ${memavail_before_kib}KiB)"
+fi
+
 # ---- discover residents (label-based, for guards only) ---------------------
 # In LIVE mode (Blocker 1) residents are NOT subtracted from A_preload — the
 # measured gpu_free_now_gib already includes them. Discovery remains for:
 # identity/revision checks and the unmanaged-GPU-tenant guard.
+EXPECTED_REV=""
+RESIDENT_LINES=""
 if command -v docker >/dev/null 2>&1; then
   # Ledger-revision check: export DGX_MEMORY_LEDGER so the adapter stamps the
   # io.inferencectl.ledger_revision label; here we compute the expected revision
   # and refuse in required mode if any resident's revision is absent/mismatched
   # (a stale resident from a different ledger generation would invalidate the plan).
-  EXPECTED_REV=""
   [ -f "$LEDGER" ] && EXPECTED_REV="$(sha256sum "$LEDGER" 2>/dev/null | cut -c1-16)"
   export DGX_MEMORY_LEDGER="$LEDGER"   # so the adapter labels the new container
+  RESIDENT_LINES="$(docker ps --filter "label=io.inferencectl.managed=true" \
+      --format '{{.Label "io.inferencectl.role"}}|{{.Label "io.inferencectl.memory_profile"}}|{{.Label "io.inferencectl.ledger_revision"}}' \
+      2>/dev/null || true)"
+  # Every running managed container must be a configured role/model pair.  A
+  # stale or experimental managed tenant cannot silently consume part of a plan
+  # computed for a different topology.
+  resident_error="$(DGX_ACTIVE_MODELS="$ACTIVE_MODELS" DGX_RESIDENT_LINES="$RESIDENT_LINES" python3 <<'PY'
+import os, tomllib
+active = tomllib.load(open(os.environ["DGX_ACTIVE_MODELS"], "rb")).get("active", {})
+seen = set()
+errors = []
+for line in os.environ.get("DGX_RESIDENT_LINES", "").splitlines():
+    if not line.strip():
+        continue
+    role, model, _revision = (line.split("|", 2) + ["", ""])[:3]
+    if role in seen:
+        errors.append(f"duplicate managed resident role {role!r}")
+    seen.add(role)
+    configured = active.get(role, {}).get("model_id")
+    if configured != model:
+        errors.append(
+            f"resident {role!r}/{model!r} is not configured "
+            f"(active model is {configured!r})"
+        )
+print("; ".join(errors))
+PY
+)"
+  [ -z "$resident_error" ] || die "managed resident topology mismatch: $resident_error"
   if [ -n "$EXPECTED_REV" ] && [ "$PREFLIGHT" = "required" ]; then
-    bad_rev=$( { docker ps --filter "label=io.inferencectl.managed=true" \
-                   --format '{{.Label "io.inferencectl.ledger_revision"}}' \
-                 | awk -v exp="$EXPECTED_REV" '$1 != exp {print "mismatch"}'; } 2>/dev/null || true)
+    bad_rev="$(printf '%s\n' "$RESIDENT_LINES" \
+      | awk -F'|' -v expected_rev="$EXPECTED_REV" \
+          'NF && $3 != expected_rev {print "mismatch"}')"
     if [ -n "$bad_rev" ]; then
       die "managed mode: a resident's ledger_revision differs from the current ledger (stale resident; restart it under the new ledger)"
     fi
@@ -170,10 +264,12 @@ if command -v docker >/dev/null 2>&1; then
           fi
         done; } 2>/dev/null || true)
     if [ -n "$gpu_unmanaged" ]; then
-      die "managed mode: unmanaged GPU container(s) present ($(echo $gpu_unmanaged | tr '\n' ' ')); cannot reason about unaccounted GPU memory"
+      die "managed mode: unmanaged GPU container(s) present ($(echo "$gpu_unmanaged" | tr '\n' ' ')); cannot reason about unaccounted GPU memory"
     fi
   fi
 fi
+
+RESIDENT_COUNT="$(printf '%s\n' "$RESIDENT_LINES" | awk 'NF {n++} END {print n+0}')"
 
 # ---- sample live free memory (GPU via torch.cuda.mem_get_info + Linux floor)-
 # GPU probe via a throwaway container (verified working). In required mode a
@@ -202,14 +298,126 @@ fi
 memavail_kib="$(awk '/MemAvailable/ {print $2}' /proc/meminfo)"
 memavail_gib="$(python3 -c "print(${memavail_kib}/1048576)")"
 
-# ---- build the transient plan + run the resolver (--format json) -----------
-# Blocker 1: pass the MEASURED gpu_free_now_gib as the A_preload. The resolver
-# uses it directly and does NOT subtract residents again (the measurement already
-# includes resident allocations). Residents are for identity/revision/guard checks.
-PLAN_TMP="$(mktemp --suffix=.toml)"
-cat > "$PLAN_TMP" <<EOF
+# ---- resolve/reuse one cold joint topology plan ----------------------------
+# The active-models file is the topology source.  On a cold start the resolver
+# proves that ALL configured minimums fit, derives each growth weight from that
+# model's target/floor, and spends the remaining usable memory jointly.  Its
+# absolute token allocations are cached under /run.  Later serialized launches
+# reuse those allocations but re-derive the fraction from their LIVE A_preload.
+JOINT_REV="$(python3 - "$LEDGER" "$ACTIVE_MODELS" "$PLAN" <<'PY'
+import hashlib, sys
+h = hashlib.sha256()
+for path in sys.argv[1:]:
+    data = open(path, "rb").read()
+    h.update(len(data).to_bytes(8, "big"))
+    h.update(data)
+print(h.hexdigest())
+PY
+)"
+
+JOINT_PLAN_TMP="$(mktemp "${TMPDIR:-/tmp}/dgx-joint-plan.XXXXXX")"
+CURRENT_PLAN_TMP="$(mktemp "${TMPDIR:-/tmp}/dgx-current-plan.XXXXXX")"
+PLANNER_ERR="$(mktemp)"
+trap 'rm -f "$JOINT_PLAN_TMP" "$CURRENT_PLAN_TMP" "$PLANNER_ERR"' EXIT
+
+if [ "$RESIDENT_COUNT" -eq 0 ]; then
+  cat > "$JOINT_PLAN_TMP" <<EOF
 device.total_gib = ${gpu_total:-121.7}
 [policy]
+allocation_mode = "floor_weighted"
+memavailable_floor_gib = ${FLOOR}
+[observed]
+gpu_free_now_gib = ${gpu_free}
+memavailable_now_gib = ${memavail_gib}
+EOF
+  python3 - "$ACTIVE_MODELS" >> "$JOINT_PLAN_TMP" <<'PY'
+import json, sys, tomllib
+active = tomllib.load(open(sys.argv[1], "rb")).get("active", {})
+if not active:
+    raise SystemExit("active-models contains no [active.*] slots")
+for role, slot in active.items():
+    model = slot.get("model_id") if isinstance(slot, dict) else None
+    if not model:
+        raise SystemExit(f"active role {role!r} has no model_id")
+    print("[[admit]]")
+    print(f"role = {json.dumps(role)}")
+    print(f"model_id = {json.dumps(model)}")
+PY
+  log "resolving cold joint plan for every configured model (floor=${FLOOR}G, memavail=${memavail_gib}G, gpu_free=${gpu_free}G)..."
+  set +e
+  JOINT_JSON="$(python3 "$PLANNER" "$LEDGER" "$JOINT_PLAN_TMP" --format json 2>"$PLANNER_ERR")"
+  JOINT_RC=$?
+  set -e
+  [ "$JOINT_RC" -eq 0 ] || die "joint memory plan REFUSED; all configured minimums must fit before any model launches"
+  STATE_TMP="$(mktemp "${JOINT_STATE}.tmp.XXXXXX")" \
+    || die "cannot create joint-plan state beside $JOINT_STATE"
+  DGX_JOINT_JSON="$JOINT_JSON" DGX_JOINT_REV="$JOINT_REV" \
+    python3 > "$STATE_TMP" <<'PY'
+import json, os
+allocation = json.loads(os.environ["DGX_JOINT_JSON"])
+if allocation.get("result") != "ADMIT":
+    raise SystemExit("joint allocation is not ADMIT")
+print(json.dumps({
+    "schema_version": 1,
+    "input_revision": os.environ["DGX_JOINT_REV"],
+    "allocation": allocation,
+}, indent=2))
+PY
+  chmod 0600 "$STATE_TMP"
+  mv -f "$STATE_TMP" "$JOINT_STATE"
+  log "joint plan committed: ${JOINT_STATE}"
+else
+  [ -f "$JOINT_STATE" ] \
+    || die "managed residents exist but the cold joint-plan state is missing; coordinated cold reload required"
+  log "reusing cold joint plan for ${RESIDENT_COUNT} configured resident(s)"
+fi
+
+# Select by role AND model.  Matching only model_id is ambiguous when a single
+# profile is assigned to multiple configured slots.
+set +e
+ALLOCATED="$(DGX_JOINT_REV="$JOINT_REV" python3 - "$JOINT_STATE" "$ROLE" "$MODEL_ID" <<'PY'
+import json, os, sys
+state_path, role, model = sys.argv[1:4]
+try:
+    state = json.load(open(state_path))
+except Exception:
+    sys.exit(1)
+if state.get("schema_version") != 1:
+    sys.exit(2)
+if state.get("input_revision") != os.environ["DGX_JOINT_REV"]:
+    sys.exit(3)
+allocation = state.get("allocation", {})
+if allocation.get("result") != "ADMIT":
+    sys.exit(4)
+matches = [
+    item for item in allocation.get("models", [])
+    if item.get("role") == role and item.get("model_id") == model
+]
+if len(matches) != 1:
+    sys.exit(5)
+item = matches[0]
+tokens = item.get("max_total_tokens")
+minimum = item.get("minimum_admissible_pool_tokens")
+if not isinstance(tokens, int) or tokens <= 0:
+    sys.exit(6)
+if not isinstance(minimum, int) or minimum <= 0 or tokens < minimum:
+    sys.exit(7)
+print(tokens, minimum)
+PY
+)"
+ALLOC_RC=$?
+set -e
+[ "$ALLOC_RC" -eq 0 ] \
+  || die "joint-plan state is stale or has no allocation for '$ROLE/$MODEL_ID' (rc=$ALLOC_RC); coordinated cold reload required"
+ALLOCATED_TOKENS="$(printf '%s' "$ALLOCATED" | awk '{print $1}')"
+
+# Re-run the ordinary single-slot gates against the current live measurements,
+# pinning the token allocation chosen by the cold joint plan.  This is where the
+# launch-time mem_fraction_static is derived; no fraction is stored or hardcoded.
+cat > "$CURRENT_PLAN_TMP" <<EOF
+device.total_gib = ${gpu_total:-121.7}
+[policy]
+allocation_mode = "fixed_targets"
 memavailable_floor_gib = ${FLOOR}
 [observed]
 gpu_free_now_gib = ${gpu_free}
@@ -217,23 +425,22 @@ memavailable_now_gib = ${memavail_gib}
 [[admit]]
 role = "${ROLE}"
 model_id = "${MODEL_ID}"
+allocated_kv_tokens = ${ALLOCATED_TOKENS}
 EOF
-log "resolving memory plan (floor=${FLOOR}G, memavail=${memavail_gib}G, gpu_free=${gpu_free}G)..."
-PLANNER_ERR="$(mktemp)"
-trap 'rm -f "$PLAN_TMP" "$PLANNER_ERR"' EXIT
+log "deriving live fraction for joint allocation (tokens=${ALLOCATED_TOKENS}, memavail=${memavail_gib}G, gpu_free=${gpu_free}G)..."
 # Capture stdout and rc SEPARATELY (correction): the resolver exits nonzero for a
 # valid REFUSE, and `|| JSON_OUT=""` would discard the structured JSON, losing the
 # ability to distinguish an intentional gate failure from malformed output.
 set +e
-JSON_OUT="$(python3 "$PLANNER" "$LEDGER" "$PLAN_TMP" --format json 2>"$PLANNER_ERR")"
-RESOLVER_RC=$?
+JSON_OUT="$(python3 "$PLANNER" "$LEDGER" "$CURRENT_PLAN_TMP" --format json 2>"$PLANNER_ERR")"
 set -e
 # parse the JSON for THIS model's derived knobs (stdlib; no grep on prose).
 # JSON passed via env (DGX_PARSE_JSON), not stdin — a bash heredoc would consume
 # stdin as the script source and break json.load.
 read_knobs() {  # prints "FRACTION MAXTOKENS MINTOKENS"; exit 0 on success
-  DGX_PARSE_JSON="$JSON_OUT" DGX_PARSE_MODEL="$MODEL_ID" python3 <<'PY'
+  DGX_PARSE_JSON="$JSON_OUT" DGX_PARSE_ROLE="$ROLE" DGX_PARSE_MODEL="$MODEL_ID" python3 <<'PY'
 import os, sys, json
+role = os.environ["DGX_PARSE_ROLE"]
 mid = os.environ["DGX_PARSE_MODEL"]
 try:
     doc = json.loads(os.environ["DGX_PARSE_JSON"])
@@ -242,7 +449,7 @@ except Exception:
 if doc.get("result") != "ADMIT":
     sys.exit(2)
 for m in doc.get("models", []):
-    if m.get("model_id") == mid:
+    if m.get("role") == role and m.get("model_id") == mid:
         f = m.get("mem_fraction_static"); mtt = m.get("max_total_tokens")
         if not (isinstance(f,(int,float)) and 0.0 < f < 1.0): sys.exit(3)
         if not (isinstance(mtt,int) and mtt > 0): sys.exit(3)
@@ -323,14 +530,17 @@ except Exception:
 if ! verify_ready; then
   log "ERROR: allocation not verified within ${ADMISSION_READY_TIMEOUT}s — killing adapter"
   kill "$ADAPTER_PID" 2>/dev/null || true
-  wait "$ADAPTER_PID" 2>/dev/null || true
   # Hardening: deterministically remove the candidate container. The adapter runs
   # docker with --rm, but killing the foreground docker client may not propagate
-  # cleanly, leaving an unverified model resident. docker rm -f is bounded to THIS
-  # container name (the candidate), never a co-resident.
+  # cleanly, leaving an unverified model resident. Remove the candidate BEFORE
+  # waiting for the client: Docker's foreground client can ignore/absorb TERM
+  # while the container continues starting, which would otherwise deadlock this
+  # cleanup path. docker rm -f is bounded to THIS container name, never a
+  # co-resident.
   if [ -n "${CONTAINER_NAME:-}" ] && command -v docker >/dev/null 2>&1; then
     docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
   fi
+  wait "$ADAPTER_PID" 2>/dev/null || true
   # release the lock (fd 9 closes on exit)
   die "role '$ROLE' failed admission verification (co-residents untouched)"
 fi

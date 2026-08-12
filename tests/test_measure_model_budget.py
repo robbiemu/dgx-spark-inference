@@ -29,6 +29,7 @@ Multi-thread loading shards: 100% Completed
 """
 
 HYBRID_LOG = """\
+[2026-01-01 00:00:00] ServerArgs(max_mamba_cache_size=None, mamba_full_memory_ratio=0.9)
 [2026-01-01 00:00:00] Load weight begin. avail mem=80.00 GB
 Multi-thread loading shards: 100% Completed
 [2026-01-01 00:01:00] Load weight end. elapsed=60s, type=HybridModel, quant=fp8, avail mem=60.00 GB, mem usage=20.00 GB.
@@ -36,6 +37,12 @@ Multi-thread loading shards: 100% Completed
 [2026-01-01 00:01:02] KV Cache is allocated. dtype: torch.float8_e4m3fn, #tokens: 300000, K size: 3.00 GB, V size: 3.00 GB
 [2026-01-01 00:01:03] max_total_num_tokens=300000, context_len=262144, available_gpu_mem=50.00 GB
 """
+
+FIXED_HYBRID_LOG = HYBRID_LOG.replace(
+    "max_mamba_cache_size=None", "max_mamba_cache_size=20"
+)
+
+AMBIGUOUS_HYBRID_LOG = "\n".join(HYBRID_LOG.splitlines()[1:]) + "\n"
 
 MULTI_POOL_LOG = """\
 [2026-01-01 00:00:00] Load weight begin. avail mem=80.00 GB
@@ -94,7 +101,7 @@ def main() -> int:
         check("TOML parses", False, str(e))
         fail += 1
 
-    say("Hybrid/Mamba: exit 0, mamba reflected in overhead")
+    say("Hybrid/Mamba: exit 0, Mamba scales separately from fixed overhead")
     rc, out, err = run_tool(HYBRID_LOG, "--model-id", "hybrid-test", "--mem-fraction", "0.50")
     if not check("exit 0", rc == 0, f"rc={rc}"):
         fail += 1
@@ -102,13 +109,52 @@ def main() -> int:
         entry = tomllib.loads(out.strip())
         prof = entry["profiles"][0]
         overhead = prof["budget"].get("static_overhead_gib", 0)
+        ratio = prof["budget"].get("mamba_kv_memory_ratio", 0)
         mamba_in_trace = "5.56" in err or "5.56" in out
-        if not check("overhead > 0 (includes Mamba)", overhead > 0, f"overhead={overhead}"):
+        if not check("fixed overhead remains independently measured", abs(overhead - 8.1) < 0.01, f"overhead={overhead}"):
+            fail += 1
+        if not check("configured Mamba/KV ratio is emitted", ratio == 0.9, f"ratio={ratio}"):
             fail += 1
         if not check("Mamba state in trace", mamba_in_trace):
             fail += 1
     except Exception as e:
         check("TOML parses", False, str(e))
+        fail += 1
+
+    say("Fixed Mamba slots: cache is fixed, not proportional to target pool")
+    rc, out, err = run_tool(
+        FIXED_HYBRID_LOG,
+        "--model-id", "fixed-hybrid",
+        "--mem-fraction", "0.50",
+    )
+    if not check("exit 0", rc == 0, f"rc={rc}"):
+        fail += 1
+    else:
+        budget = tomllib.loads(out)["profiles"][0]["budget"]
+        if not check(
+            "fixed Mamba field emitted",
+            budget.get("fixed_mamba_cache_gib") == 5.56,
+            str(budget),
+        ):
+            fail += 1
+        if not check(
+            "proportional ratio omitted",
+            "mamba_kv_memory_ratio" not in budget,
+            str(budget),
+        ):
+            fail += 1
+
+    say("Ambiguous hybrid log: refuse rather than guess cache scaling")
+    rc, out, err = run_tool(
+        AMBIGUOUS_HYBRID_LOG,
+        "--model-id", "ambiguous-hybrid",
+        "--mem-fraction", "0.50",
+    )
+    if not check("exit nonzero", rc != 0, f"rc={rc}"):
+        fail += 1
+    if not check("empty stdout", out.strip() == "", repr(out[:80])):
+        fail += 1
+    if not check("stderr explains ambiguity", "does not reveal" in err):
         fail += 1
 
     say("Multiple KV pools: nonzero, empty stdout, stderr explains")
@@ -148,6 +194,53 @@ def main() -> int:
     rc, out, err = run_tool("test", "--model-id", "x", "--mem-fraction", "-1")
     if not check("exit nonzero", rc != 0, f"rc={rc}"):
         fail += 1
+
+    say("Invalid negative Mamba/KV ratio: nonzero")
+    rc, out, err = run_tool(
+        HYBRID_LOG,
+        "--model-id", "x",
+        "--mem-fraction", "0.5",
+        "--mamba-kv-memory-ratio", "-0.1",
+    )
+    if not check("exit nonzero", rc != 0, f"rc={rc}"):
+        fail += 1
+
+    say("Explicit Mamba/KV ratio overrides rounded log ratio")
+    rc, out, err = run_tool(
+        HYBRID_LOG,
+        "--model-id", "hybrid-explicit",
+        "--mem-fraction", "0.5",
+        "--mamba-kv-memory-ratio", "0.9",
+    )
+    if not check("exit 0", rc == 0, f"rc={rc}"):
+        fail += 1
+    else:
+        ratio = tomllib.loads(out)["profiles"][0]["budget"].get(
+            "mamba_kv_memory_ratio"
+        )
+        if not check("explicit ratio emitted unchanged", ratio == 0.9, f"ratio={ratio}"):
+            fail += 1
+
+    say("Configured target and useful ceiling emit independently of measured pool")
+    rc, out, err = run_tool(
+        DENSE_LOG,
+        "--model-id", "bounded",
+        "--mem-fraction", "0.6",
+        "--minimum-pool", "256000",
+        "--target-pool", "512000",
+        "--maximum-useful-pool", "768000",
+    )
+    if not check("exit 0", rc == 0, f"rc={rc}"):
+        fail += 1
+    else:
+        budget = tomllib.loads(out)["profiles"][0]["budget"]
+        ok = (
+            budget["minimum_admissible_pool_tokens"] == 256000
+            and budget["target_kv_tokens"] == 512000
+            and budget["maximum_useful_pool_tokens"] == 768000
+        )
+        if not check("configured bounds emitted", ok, str(budget)):
+            fail += 1
 
     # ---- fraction_base: --fraction-base and --device-total-gib ----
 

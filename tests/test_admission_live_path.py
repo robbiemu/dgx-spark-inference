@@ -17,6 +17,7 @@ broken on the live path:
 from __future__ import annotations
 
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -28,6 +29,10 @@ ROOT = Path(__file__).resolve().parents[1]
 ADMISSION = ROOT / "src" / "inferencectl" / "admission.sh"
 DISPATCH = ROOT / "src" / "inferencectl" / "dispatch.sh"
 RESOLVER = ROOT / "tools" / "memory_planner" / "resolve_memory_plan.py"
+PYTHON_BIN = Path(
+    shutil.which(f"python{sys.version_info.major}.{sys.version_info.minor}")
+    or sys.executable
+).parent
 
 failures = []
 def check(name, cond, detail=""):
@@ -42,12 +47,45 @@ def _stub(dirpath: Path, name: str, body: str) -> Path:
     return p
 
 
+def _stub_flock(dirpath: Path) -> None:
+    _stub(dirpath, "flock", '''
+python3 - "$@" <<'PY'
+import fcntl, sys
+fcntl.flock(int(sys.argv[-1]), fcntl.LOCK_EX)
+PY
+''')
+
+
+def _stub_awk(dirpath: Path) -> None:
+    _stub(dirpath, "awk", '''
+if [ "${!#}" = "/proc/meminfo" ]; then echo 104857600; exit 0; fi
+exec /usr/bin/awk "$@"
+''')
+
+
+def _stub_sha256sum(dirpath: Path) -> None:
+    _stub(
+        dirpath,
+        "sha256sum",
+        'echo "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  $1"',
+    )
+
+
 def _admit_resolver(dirpath: Path) -> Path:
     # emits an ADMIT for ornith-1.0-9b-fp8 with arbitrary knobs; the REAL resolver
     # is not used here because we want to assert the FLOOR/FREE_GIB plumbing, not
     # the algebra (that's T12/T13 in the resolver's own tests).
-    return _stub(dirpath, "resolve_memory_plan.py", """import json
-print(json.dumps({"result":"ADMIT","exit_code":0,"models":[{"model_id":"ornith-1.0-9b-fp8","mem_fraction_static":0.42,"max_total_tokens":200000,"minimum_admissible_pool_tokens":32768,"overall_pass":true}]}))
+    return _stub(dirpath, "resolve_memory_plan.py", """import json, sys, tomllib
+plan = tomllib.load(open(sys.argv[2], "rb"))
+models = [{
+    "role": slot["role"],
+    "model_id": slot["model_id"],
+    "mem_fraction_static": 0.42,
+    "max_total_tokens": int(slot.get("allocated_kv_tokens", 200000)),
+    "minimum_admissible_pool_tokens": 32768,
+    "overall_pass": True,
+} for slot in plan.get("admit", [])]
+print(json.dumps({"result":"ADMIT","exit_code":0,"models":models}))
 """)
 
 
@@ -63,6 +101,12 @@ def _run_admission(stub_dir: Path, *, preflight="required", pair=True, plan_floo
         if plan_floor is not None:
             plan_body += f"memavailable_floor_gib = {plan_floor}\n"
         plan.write_text(plan_body)
+    (td / "active-models.toml").write_text(
+        '[active.r]\nmodel_id="ornith-1.0-9b-fp8"\nruntime_id="test"\n'
+    )
+    _stub_flock(td)
+    _stub_awk(td)
+    _stub_sha256sum(td)
     _stub(td, "docker", docker_body or '''case "$1" in
   run) echo "FREE_GIB 40.00 TOTAL_GIB 121.70" ;;
   ps)  : ;;
@@ -75,11 +119,13 @@ esac''')
     marker.unlink(missing_ok=True)
     _stub(td, "fake-adapter", f"echo ran > {marker}; exec sleep 5")
     env = dict(os.environ)
-    env["PATH"] = f"{td}:{env['PATH']}"
+    env["PATH"] = f"{td}:{PYTHON_BIN}:{env['PATH']}"
     env["CONFIG_ROOT"] = str(td); env["PROJECT_ROOT"] = str(ROOT)
     env["DGX_MEMORY_PREFLIGHT"] = preflight
     env["DGX_MEMORY_LEDGER"] = str(ledger); env["DGX_MEMORY_PLAN"] = str(plan)
     env["DGX_MEMORY_PLANNER"] = str(td / "resolve_memory_plan.py")
+    env["ACTIVE_MODELS"] = str(td / "active-models.toml")
+    env["DGX_MEMORY_PLAN_STATE"] = str(td / "joint-state.json")
     env["DGX_ADMISSION_LOCK"] = str(td / "lock")
     env["DGX_ADMISSION_READY_TIMEOUT"] = "2"
     env["PORT"] = "30199"; env["SGLANG_API_KEY"] = "0" * 64
@@ -116,6 +162,9 @@ def _run_dispatch(stub_dir: Path, *, preflight, admission_present, pair_state) -
         (td / "memory_ledger.toml").touch()
     if pair_state == "both":
         (td / "memory_plan.toml").touch()
+    _stub_flock(td)
+    _stub_awk(td)
+    _stub_sha256sum(td)
     # docker stub must distinguish run/ps/inspect (the GPU probe + guards call these)
     _stub(td, "docker", '''case "$1" in
   run) echo "FREE_GIB 40.00 TOTAL_GIB 121.70" ;;
@@ -128,12 +177,14 @@ esac''')
     marker = td / "ran.txt"; marker.unlink(missing_ok=True)
     _stub(td, "fake-adapter", f"echo ran > {marker}; exec sleep 5")
     env = dict(os.environ)
-    env["PATH"] = f"{td}:{env['PATH']}"
+    env["PATH"] = f"{td}:{PYTHON_BIN}:{env['PATH']}"
     env["CONFIG_ROOT"] = str(td); env["PROJECT_ROOT"] = str(ROOT)
     env["DGX_MEMORY_PREFLIGHT"] = preflight
     env["DGX_MEMORY_LEDGER"] = str(td / "memory_ledger.toml")
     env["DGX_MEMORY_PLAN"] = str(td / "memory_plan.toml")
     env["DGX_MEMORY_PLANNER"] = str(td / "resolve_memory_plan.py")
+    env["ACTIVE_MODELS"] = str(td / "active-models.toml")
+    env["DGX_MEMORY_PLAN_STATE"] = str(td / "joint-state.json")
     env["DGX_ADMISSION_LOCK"] = str(td / "lock")
     env["DGX_ADMISSION_READY_TIMEOUT"] = "2"
     env["PORT"] = "30199"; env["SGLANG_API_KEY"] = "0" * 64
@@ -168,6 +219,12 @@ def main() -> int:
     td3 = Path(tempfile.mkdtemp())
     (td3 / "memory_ledger.toml").touch()
     (td3 / "memory_plan.toml").write_text("[policy]\nmemavailable_floor_gib = 6.0\n")
+    (td3 / "active-models.toml").write_text(
+        '[active.r]\nmodel_id="ornith-1.0-9b-fp8"\nruntime_id="test"\n'
+    )
+    _stub_flock(td3)
+    _stub_awk(td3)
+    _stub_sha256sum(td3)
     _stub(td3, "docker", '''case "$1" in
   run) echo "FREE_GIB 40.00 TOTAL_GIB 121.70" ;;
   ps)  : ;;
@@ -176,12 +233,14 @@ esac''')
     _stub(td3, "curl", "echo {}; exit 0")
     _stub(td3, "fake-adapter", "echo ran; exec sleep 5")
     env3 = dict(os.environ)
-    env3["PATH"] = f"{td3}:{env3['PATH']}"
+    env3["PATH"] = f"{td3}:{PYTHON_BIN}:{env3['PATH']}"
     env3["CONFIG_ROOT"] = str(td3); env3["PROJECT_ROOT"] = str(ROOT)
     env3["DGX_MEMORY_PREFLIGHT"] = "required"
     env3["DGX_MEMORY_LEDGER"] = str(ROOT / "tools" / "memory_planner" / "budget_ledger.toml")
     env3["DGX_MEMORY_PLAN"] = str(td3 / "memory_plan.toml")
     env3["DGX_MEMORY_PLANNER"] = str(RESOLVER)   # the REAL resolver
+    env3["ACTIVE_MODELS"] = str(td3 / "active-models.toml")
+    env3["DGX_MEMORY_PLAN_STATE"] = str(td3 / "joint-state.json")
     env3["DGX_ADMISSION_LOCK"] = str(td3 / "lock")
     env3["DGX_ADMISSION_READY_TIMEOUT"] = "2"
     env3["PORT"] = "30199"; env3["SGLANG_API_KEY"] = "0" * 64

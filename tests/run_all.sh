@@ -72,6 +72,12 @@ python3 tests/test_measure_model_budget.py || fail=1
 python3 tests/test_fraction_base_validation.py || fail=1
 python3 tests/test_adapter_precedence.py || fail=1
 
+say "Test 13b — joint floor-first allocation is configuration-derived"
+python3 tests/test_joint_memory_planner.py || fail=1
+
+say "Test 13c — live admission plans the full topology once and reuses it"
+python3 tests/test_admission_joint_topology.py || fail=1
+
 say "Test 14 — managed model profiles use pinned standard-cache snapshots"
 python3 tests/test_managed_profiles_use_hf_cache.py || fail=1
 

@@ -130,6 +130,35 @@ resolve_model_dir() {  # resolve_model_dir <spec> <cache_root> <container_cache_
   printf '%s|%s' "${cont_cache}/${host_rel}" "${cache_root}/${host_rel}"
 }
 
+# Render optional single-model engine flags from the profile. Existing profiles
+# omit these keys and therefore preserve their current launch behavior.
+build_model_args() {  # build_model_args <spec>
+  local spec="$1" args="" value key_flag key flag
+  value="$(toml_get "$spec" launch.needs_trust_remote_code 2>/dev/null || true)"
+  [ "$value" = "True" ] && args="$args --trust-remote-code"
+  for key_flag in \
+    "attention_backend:attention-backend" \
+    "prefill_attention_backend:prefill-attention-backend" \
+    "decode_attention_backend:decode-attention-backend" \
+    "page_size:page-size" \
+    "fp4_gemm_backend:fp4-gemm-backend" \
+    "moe_runner_backend:moe-runner-backend" \
+    "mamba_backend:mamba-backend" \
+    "mamba_ssm_dtype:mamba-ssm-dtype" \
+    "max_mamba_cache_size:max-mamba-cache-size" \
+    "mamba_radix_cache_strategy:mamba-radix-cache-strategy" \
+    "chunked_prefill_size:chunked-prefill-size" \
+    "cuda_graph_max_bs_decode:cuda-graph-max-bs-decode"; do
+    key="${key_flag%%:*}"
+    flag="${key_flag#*:}"
+    value="$(toml_get "$spec" "launch.${key}" 2>/dev/null || true)"
+    [ -n "$value" ] && args="$args --${flag} $value"
+  done
+  value="$(toml_get "$spec" launch.disable_cuda_graph 2>/dev/null || true)"
+  [ "$value" = "True" ] && args="$args --disable-cuda-graph"
+  printf '%s' "$args"
+}
+
 [ -f "$SPEC_PATH" ] || { echo "REFUSING: spec missing: $SPEC_PATH" >&2; exit 1; }
 MANIFEST="$RUNTIME_ROOT/runtime-manifest.toml"
 IMAGE="$(toml_get "$MANIFEST" image)"
@@ -143,6 +172,12 @@ if [ "${DGX_INFERENCE_EXPERIMENTAL:-0}" = "1" ] && [ -n "${DGX_RUNTIME_IMAGE:-}"
 fi
 HOST_BIND="$(toml_get "$MANIFEST" common_launch.host_bind)"
 CACHE_ROOT="$(toml_get "$MANIFEST" common_launch.container_cache_root)"
+
+# No-launch probe used by tests and profile tooling.
+if [ "${8:-}" = "emit-model-args" ]; then
+  build_model_args "$SPEC_PATH"
+  exit 0
+fi
 
 # ---- emit_yaml: the ONE render path (used live AND by the --emit-yaml probe) -
 # Writes (or prints, see mode) the runtime YAML from merged values.
@@ -249,6 +284,7 @@ EOF
   LEDGER_REV=""
   [ -n "${DGX_MEMORY_LEDGER:-}" ] && [ -f "$DGX_MEMORY_LEDGER" ] \
     && LEDGER_REV="$(sha256sum "$DGX_MEMORY_LEDGER" 2>/dev/null | cut -c1-16)"
+  MODEL_ARGS="$(build_model_args "$SPEC_PATH")"
   exec /usr/bin/docker run \
     --rm --name "$CONTAINER_NAME" --gpus all --ipc host \
     --label io.inferencectl.managed=true \
@@ -259,8 +295,8 @@ EOF
     --volume "${MODEL_CACHE_ROOT}:${CACHE_ROOT}:ro" \
     --volume "${RUNTIME_CONFIG_HOST}:${RUNTIME_CONFIG_CONTAINER}:ro" \
     --entrypoint /bin/sh "$IMAGE" \
-    -ceu 'exec sglang serve --model-path "$1" --config "$2"' \
-    sh "$CONTAINER_MODEL_PATH" "$RUNTIME_CONFIG_CONTAINER"
+    -ceu 'if [ -n "$3" ]; then exec sglang serve --model-path "$1" --config "$2" $3; else exec sglang serve --model-path "$1" --config "$2"; fi' \
+    sh "$CONTAINER_MODEL_PATH" "$RUNTIME_CONFIG_CONTAINER" "$MODEL_ARGS"
 
 elif [ "$KIND" = "bundle" ]; then
   # ---- COORDINATED BUNDLE (target + drafter + speculation) ------------------
