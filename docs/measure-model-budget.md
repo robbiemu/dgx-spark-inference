@@ -88,6 +88,9 @@ python3 tools/memory_planner/measure_model_budget.py \
   --log "$LOG" \
   --model-id my-model-id \
   --mem-fraction 0.60 \
+  --minimum-pool 262144 \
+  --target-pool 524288 \
+  --maximum-useful-pool 786432 \
   > "$ENTRY"
 ```
 
@@ -101,14 +104,16 @@ DERIVATION TRACE for my-model-id
 ============================================================
   weights_gib                    = 27.57
     ← 22.11 (Qwen3_5ForConditionalGeneration); 5.46 (MTP draft)
-  target_kv_tokens               = 313966
+  measured_kv_tokens             = 313966
     ← KV Cache is allocated. #tokens: 313966, K size: ... V size: ...
   kv_bytes_per_token             = 32673.8
     ← (K_size + V_size) GiB / tokens
   mamba_cache_gib                = 5.56
     ← Mamba Cache is allocated. ssm_state: 3.23GB ...
-  static_overhead_gib            = 5.56
-    ← (0.6 × A_preload) - (weights + kv + pad)
+  mamba_kv_memory_ratio          = 0.9
+    ← mamba_full_memory_ratio from server arguments
+  static_overhead_gib            = ...
+    ← (0.6 × A_preload) - (weights + kv + Mamba + pad)
 ============================================================
 ```
 
@@ -126,6 +131,12 @@ DERIVATION TRACE for my-model-id
   low — re-run with a higher `--mem-fraction`.
 - **`cuda_graph_peak_gib`**: the transient graph-capture peak (optional; may
   be 0 if graph capture is disabled).
+- **Mamba allocation mode**: an explicit numeric `max_mamba_cache_size` makes
+  the measured Mamba cache fixed; `max_mamba_cache_size=None` makes it scale
+  according to `mamba_full_memory_ratio`. The tool records these as
+  `fixed_mamba_cache_gib` and `mamba_kv_memory_ratio`, respectively. If a
+  hybrid log does not expose the setting, the tool refuses rather than guess;
+  pass `--mamba-cache-allocation fixed|proportional` after verifying the launch.
 
 ### Adjusting the output
 
@@ -134,8 +145,11 @@ The tool emits sensible defaults for `static_pad_gib` (0.5),
 with `--static-pad`, `--request-workspace`, `--gpu-headroom` if your
 measurements differ.
 
-Set `--minimum-pool` to the role's contract floor (the minimum pool the role
-requires to function — e.g. 262144 for a full-context primary).
+Set `--minimum-pool` to the role's hard contract floor, `--target-pool` to its
+configured expected demand, and `--maximum-useful-pool` to the launch
+configuration's `context_length × max_running_requests`. These settings—not
+the one measurement run's realized token count—drive joint proportional
+allocation.
 
 ## Step 3 — Add the entry to the budget ledger
 
@@ -152,6 +166,7 @@ python3 tools/memory_planner/resolve_memory_plan.py \
   tools/memory_planner/budget_ledger.toml \
   <(echo 'device.total_gib = 121.7
 [policy]
+allocation_mode = "floor_weighted"
 memavailable_floor_gib = 8.0
 [observed]
 gpu_free_now_gib = 121.7

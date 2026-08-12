@@ -15,6 +15,8 @@ Cases:
      keeps the admission lock held; a second concurrent admission for a different
      role cannot complete admission until the first releases.
   D) legacy/auto mode with no planner pair -> adapter runs directly (no lock).
+  E) timeout cleanup removes the candidate container before waiting for a
+     foreground Docker client that does not exit on TERM.
 
 No GPU/docker: the stubs return canned docker/resolver output. The real
 admission.sh logic (lock acquire, enrollment, env clearing, verify loop) runs.
@@ -23,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -33,6 +36,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 ADMISSION = ROOT / "src" / "inferencectl" / "admission.sh"
+PYTHON_BIN = Path(
+    shutil.which(f"python{sys.version_info.major}.{sys.version_info.minor}")
+    or sys.executable
+).parent
 
 failures = []
 def check(name, cond, detail=""):
@@ -69,13 +76,47 @@ exit 0
 ''')
 
 
+def _fake_flock(dirpath: Path) -> Path:
+    """Portable flock(1) stand-in for macOS; locks the inherited numeric fd."""
+    return _write_stub(dirpath, "flock", '''
+python3 - "$@" <<'PY'
+import fcntl, sys
+fcntl.flock(int(sys.argv[-1]), fcntl.LOCK_EX)
+PY
+''')
+
+
+def _fake_awk(dirpath: Path) -> Path:
+    """Supply a deterministic MemAvailable value on hosts without /proc."""
+    return _write_stub(dirpath, "awk", '''
+if [ "${!#}" = "/proc/meminfo" ]; then echo 104857600; exit 0; fi
+exec /usr/bin/awk "$@"
+''')
+
+
+def _fake_sha256sum(dirpath: Path) -> Path:
+    return _write_stub(
+        dirpath,
+        "sha256sum",
+        'echo "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  $1"\n',
+    )
+
+
 def _fake_resolver_admit(dirpath: Path, frac="0.80", mtt="376048", mintok="32768") -> Path:
     return _write_stub(dirpath, "resolve_memory_plan.py", f'''
-import json
-doc = {{"result":"ADMIT","exit_code":0,"models":[
-  {{"model_id":"ornith-1.0-9b-fp8","mem_fraction_static":{frac},
-   "max_total_tokens":{mtt},"minimum_admissible_pool_tokens":{mintok},
-   "overall_pass":True}}]}}
+import json, sys, tomllib
+plan = tomllib.load(open(sys.argv[2], "rb"))
+models = []
+for slot in plan.get("admit", []):
+    models.append({{
+        "role": slot["role"],
+        "model_id": slot["model_id"],
+        "mem_fraction_static": {frac},
+        "max_total_tokens": int(slot.get("allocated_kv_tokens", {mtt})),
+        "minimum_admissible_pool_tokens": {mintok},
+        "overall_pass": True,
+    }})
+doc = {{"result":"ADMIT","exit_code":0,"models":models}}
 print(json.dumps(doc))
 ''')
 
@@ -84,16 +125,23 @@ def _run_admission(stub_dir: Path, env_overrides: dict, preflight="required",
                    model_id="ornith-1.0-9b-fp8", marker=None) -> subprocess.Popen:
     """Launch admission.sh with stubs on PATH; returns the Popen."""
     stubs = stub_dir
+    _fake_flock(stubs)
+    _fake_awk(stubs)
+    _fake_sha256sum(stubs)
     ledger = stubs / "memory_ledger.toml"; ledger.touch()
     plan = stubs / "memory_plan.toml"; plan.touch()
+    (stubs / "active-models.toml").write_text(
+        f'[active.agentic-helper]\nmodel_id="{model_id}"\nruntime_id="test"\n'
+    )
     env = dict(os.environ)
-    env["PATH"] = f"{stubs}:{env['PATH']}"
+    env["PATH"] = f"{stubs}:{PYTHON_BIN}:{env['PATH']}"
     env["CONFIG_ROOT"] = str(stubs)
     env["PROJECT_ROOT"] = str(ROOT)
     env["DGX_MEMORY_PREFLIGHT"] = preflight
     env["DGX_MEMORY_LEDGER"] = str(ledger)
     env["DGX_MEMORY_PLAN"] = str(plan)
     env["DGX_MEMORY_PLANNER"] = str(stubs / "resolve_memory_plan.py")
+    env["ACTIVE_MODELS"] = str(stubs / "active-models.toml")
     env["DGX_ADMISSION_LOCK"] = str(stubs / "test.lock")
     env["DGX_ADMISSION_READY_TIMEOUT"] = "20"
     env["PORT"] = "30199"
@@ -101,6 +149,9 @@ def _run_admission(stub_dir: Path, env_overrides: dict, preflight="required",
     # each admission gets its OWN lock file (cases share td; orphaned fake-adapter
     # children from earlier cases must not hold a later case's lock).
     env["DGX_ADMISSION_LOCK"] = str(stubs / f"test.{marker.name if marker else 'default'}.lock")
+    env["DGX_MEMORY_PLAN_STATE"] = str(
+        stubs / f"state.{marker.name if marker else 'default'}.json"
+    )
     # point curl at nothing real; verify_ready will fail-timeout OR be satisfied by stub
     env["DGX_INFERENCE_EXPERIMENTAL"] = "1"  # avoid sourcing real inference.env
     env.update(env_overrides)
@@ -152,12 +203,13 @@ import json; print(json.dumps({"result":"REFUSE","exit_code":1,"models":[]})); e
     marker_b = td / "B_env.txt"
     pb = _run_admission(td, {}, marker=marker_b)
     try:
-        rc = pb.wait(timeout=15)
+        out_b, err_b = pb.communicate(timeout=15); rc = pb.returncode
     except subprocess.TimeoutExpired:
-        pb.kill(); rc = -1
+        pb.kill(); out_b, err_b = pb.communicate(); rc = -1
     check("REFUSE did not launch adapter", not marker_b.exists(),
           f"adapter ran: {marker_b.read_text() if marker_b.exists() else ''!r}")
-    check("REFUSE exit code 75 (deliberate refusal)", rc == 75, f"rc={rc}")
+    check("REFUSE exit code 75 (deliberate refusal)", rc == 75,
+          f"rc={rc} out={out_b[-200:]!r} err={err_b[-300:]!r}")
 
     print("=== Case C: SERIALIZATION — second admission blocks while first holds lock ===")
     # reset to an admitting resolver
@@ -200,7 +252,7 @@ import json; print(json.dumps({"result":"REFUSE","exit_code":1,"models":[]})); e
     # no memory_ledger.toml / memory_plan.toml in CONFIG_ROOT -> legacy
     adapter_d = _fake_adapter_capture(td2, td2 / "D_env.txt")
     env_d = dict(os.environ)
-    env_d["PATH"] = f"{td2}:{env_d['PATH']}"
+    env_d["PATH"] = f"{td2}:{PYTHON_BIN}:{env_d['PATH']}"
     env_d["CONFIG_ROOT"] = str(td2)
     env_d["PROJECT_ROOT"] = str(ROOT)
     env_d["DGX_MEMORY_PREFLIGHT"] = "auto"
@@ -218,7 +270,61 @@ import json; print(json.dumps({"result":"REFUSE","exit_code":1,"models":[]})); e
     check("auto/no-pair legacy: adapter launched directly",
           (td2 / "D_env.txt").exists(), "adapter did not run in legacy mode")
 
-    print(f"\n=== {['Case A','Case B','Case C','Case D']} ===" )
+    print("=== Case E: timeout removes candidate before waiting for Docker client ===")
+    td3 = Path(tempfile.mkdtemp())
+    _fake_flock(td3)
+    _fake_awk(td3)
+    _fake_sha256sum(td3)
+    _fake_resolver_admit(td3, "0.80", "376048", "32768")
+    (td3 / "memory_ledger.toml").touch()
+    (td3 / "memory_plan.toml").touch()
+    (td3 / "active-models.toml").write_text(
+        '[active.agentic-helper]\nmodel_id="ornith-1.0-9b-fp8"\nruntime_id="test"\n'
+    )
+    cleanup_marker = td3 / "docker-rm.txt"
+    _write_stub(td3, "docker", f'''case "$1" in
+  run) echo "FREE_GIB 40.00 TOTAL_GIB 121.70" ;;
+  ps) : ;;
+  inspect) echo "null" ;;
+  rm) touch "{cleanup_marker}" ;;
+esac
+exit 0
+''')
+    _write_stub(td3, "curl", 'echo "{}"; exit 0')
+    adapter_e = _write_stub(td3, "stubborn-adapter", f'''
+trap '' TERM
+while [ ! -f "{cleanup_marker}" ]; do sleep 0.1; done
+exit 0
+''')
+    env_e = dict(os.environ)
+    env_e.update({
+        "PATH": f"{td3}:{PYTHON_BIN}:{env_e['PATH']}",
+        "CONFIG_ROOT": str(td3),
+        "PROJECT_ROOT": str(ROOT),
+        "DGX_MEMORY_PREFLIGHT": "required",
+        "DGX_MEMORY_LEDGER": str(td3 / "memory_ledger.toml"),
+        "DGX_MEMORY_PLAN": str(td3 / "memory_plan.toml"),
+        "DGX_MEMORY_PLANNER": str(td3 / "resolve_memory_plan.py"),
+        "ACTIVE_MODELS": str(td3 / "active-models.toml"),
+        "DGX_ADMISSION_LOCK": str(td3 / "test.lock"),
+        "DGX_MEMORY_PLAN_STATE": str(td3 / "state.json"),
+        "DGX_ADMISSION_READY_TIMEOUT": "1",
+        "DGX_INFERENCE_EXPERIMENTAL": "1",
+        "PORT": "30199",
+        "CONTAINER_NAME": "candidate-helper",
+        "SGLANG_API_KEY": "0" * 64,
+    })
+    pe = subprocess.run(
+        ["bash", str(ADMISSION), "agentic-helper", str(ROOT / "runtime/sglang"),
+         str(ROOT), "ornith-1.0-9b-fp8", "model", "unused.toml",
+         "agentic-helper", str(adapter_e)],
+        env=env_e, capture_output=True, text=True, timeout=8,
+    )
+    check("timeout forcibly removed the bounded candidate container",
+          pe.returncode == 75 and cleanup_marker.exists(),
+          f"rc={pe.returncode} out={pe.stdout[-200:]!r} err={pe.stderr[-200:]!r}")
+
+    print(f"\n=== {['Case A','Case B','Case C','Case D','Case E']} ===" )
     if failures:
         print(f"FAIL: {len(failures)} check(s) failed: {failures}", file=sys.stderr)
         return 1

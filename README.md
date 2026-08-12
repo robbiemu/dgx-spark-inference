@@ -514,19 +514,30 @@ sudo cp tools/memory_planner/budget_ledger.toml \
   /etc/dgx-spark-inference/memory_ledger.toml
 ```
 
-Write `/etc/dgx-spark-inference/memory_plan.toml` for this host’s intended residency. It must include the primary as a resident and the helper as an admissible role:
+Write `/etc/dgx-spark-inference/memory_plan.toml` with this host’s system-memory policy:
 
 ```toml
-[[resident]]
-role = "agentic"
-model_id = "qwen36-27b-fp8"
-
-[[admit]]
-role = "agentic-helper"
-model_id = "ornith-1.0-9b-fp8"
+[policy]
+memavailable_floor_gib = 8.0
+reclaim_page_cache_before_probe = true  # GB10 unified-memory host
 ```
 
-Use the measured helper budget and host floor for this machine. Do not transplant a static `mem_fraction_static` from an earlier probe. Admission derives the fraction from current free memory and caps the pool with `max_total_tokens`.
+The full model topology comes from every entry in the operator-owned
+`active-models.toml`. On a cold start, admission first proves that all configured
+model floors fit, then divides the usable surplus using each ledger profile’s
+configuration-derived `target_kv_tokens / minimum_admissible_pool_tokens`
+total-pool weight. Configured `maximum_useful_pool_tokens` ceilings prevent a
+slot from receiving more than its context/concurrency can use; released surplus
+is redistributed to uncapped slots. Do not transplant a static
+`mem_fraction_static` from an earlier probe.
+Each serialized launch derives its fraction from current free memory and uses
+the jointly allocated `max_total_tokens` cap.
+
+On GB10, model loading can leave checkpoint and container files in clean Linux
+page cache. Linux includes these reclaimable pages in `MemAvailable`, but CUDA's
+free-memory probe does not. The explicit reclaim policy above discards only
+clean cache before each serialized probe so it cannot create a false refusal;
+the configured `memavailable_floor_gib` still protects host memory.
 
 #### 9. Start, verify, and inspect the helper
 

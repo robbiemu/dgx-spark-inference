@@ -13,6 +13,7 @@ logic (the lock/resolver path is covered by T8).
 from __future__ import annotations
 
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -22,6 +23,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 ADMISSION = ROOT / "src" / "inferencectl" / "admission.sh"
+PYTHON_BIN = Path(
+    shutil.which(f"python{sys.version_info.major}.{sys.version_info.minor}")
+    or sys.executable
+).parent
 
 failures = []
 def check(name, cond, detail=""):
@@ -36,6 +41,23 @@ def _stub(dirpath: Path, name: str, body: str) -> Path:
     return p
 
 
+def _stub_flock(dirpath: Path) -> None:
+    _stub(dirpath, "flock", '''
+python3 - "$@" <<'PY'
+import fcntl, sys
+fcntl.flock(int(sys.argv[-1]), fcntl.LOCK_EX)
+PY
+''')
+
+
+def _stub_sha256sum(dirpath: Path) -> None:
+    _stub(
+        dirpath,
+        "sha256sum",
+        'echo "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  $1"',
+    )
+
+
 def _run(stub_dir: Path, *, preflight: str, ledger_exists: bool, plan_exists: bool,
          docker_body: str, env_extra: dict | None = None) -> tuple[int, str, str, bool]:
     """Run admission.sh with the given pair state + docker stub. Returns
@@ -46,6 +68,11 @@ def _run(stub_dir: Path, *, preflight: str, ledger_exists: bool, plan_exists: bo
     ledger.unlink(missing_ok=True); plan.unlink(missing_ok=True)
     if ledger_exists: ledger.touch()
     if plan_exists: plan.touch()
+    (td / "active-models.toml").write_text(
+        '[active.r]\nmodel_id="ornith-1.0-9b-fp8"\nruntime_id="test"\n'
+    )
+    _stub_flock(td)
+    _stub_sha256sum(td)
     marker = td / "ran.txt"; marker.unlink(missing_ok=True)
     _stub(td, "docker", docker_body)
     _stub(td, "curl", "echo {}; exit 0")  # no realized -> would loop, but we exit before that
@@ -53,13 +80,15 @@ def _run(stub_dir: Path, *, preflight: str, ledger_exists: bool, plan_exists: bo
           'import json\nprint(json.dumps({"result":"ADMIT","exit_code":0,"models":[]}))')
     _stub(td, "fake-adapter", f"echo ran > {marker}; exec sleep 5")
     env = dict(os.environ)
-    env["PATH"] = f"{td}:{env['PATH']}"
+    env["PATH"] = f"{td}:{PYTHON_BIN}:{env['PATH']}"
     env["CONFIG_ROOT"] = str(td)
     env["PROJECT_ROOT"] = str(ROOT)
     env["DGX_MEMORY_PREFLIGHT"] = preflight
     env["DGX_MEMORY_LEDGER"] = str(ledger)
     env["DGX_MEMORY_PLAN"] = str(plan)
     env["DGX_MEMORY_PLANNER"] = str(td / "resolve_memory_plan.py")
+    env["ACTIVE_MODELS"] = str(td / "active-models.toml")
+    env["DGX_MEMORY_PLAN_STATE"] = str(td / "joint-state.json")
     env["DGX_ADMISSION_LOCK"] = str(td / "lock")
     env["DGX_ADMISSION_READY_TIMEOUT"] = "3"
     env["PORT"] = "30199"
