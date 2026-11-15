@@ -69,6 +69,7 @@ say "Test 12 — health-wait gate succeeds and fails closed"
 python3 tests/test_wait_for_health.py || fail=1
 # Planner: measurement tool, fraction_base validation, adapter precedence.
 python3 tests/test_measure_model_budget.py || fail=1
+python3 tests/test_tied_kv_pools.py || fail=1
 python3 tests/test_fraction_base_validation.py || fail=1
 python3 tests/test_adapter_precedence.py || fail=1
 

@@ -274,12 +274,50 @@ versus realized across multiple runs.
 
 ### Multiple KV pools (composite KV allocation)
 
-If the measurement tool reports "multiple KV pools found," it refuses to emit
-a TOML entry. **Do not enroll this profile in planner mode.** The current
-ledger schema and resolver do not support composite KV allocation (e.g. MTP
-with separate target + draft pools). Keep the profile on the validated legacy
-path (hardcoded `mem_fraction_static`) until explicit multi-pool accounting
-is implemented.
+Multiple allocation reports still refuse by default. To measure **N disjoint
+components tied to the same token capacity**, explicitly pass
+`--tied-kv-pools N`, where N is at least two. Omitting the option or setting it
+to one preserves single-pool behavior. Component count is unrelated to serving
+role count: one model in one role can have three or more tied components.
+
+Portable example (the log must come from a separately qualified runtime):
+
+```bash
+python3 tools/memory_planner/measure_model_budget.py \
+  --model-id example-tied-model \
+  --mem-fraction 0.60 \
+  --tied-kv-pools 3 < "$LOG" > "$ENTRY"
+```
+
+The parser requires exactly N `KV Cache is allocated.` reports, each with one
+positive integer `#tokens` (or `tokens`) value and finite nonnegative `K size`
+and `V size` fields in GB/GiB. As with the existing SGLang measurement convention,
+these units are interpreted as binary GiB. Each component's combined K+V size
+must be positive, and every token capacity must match. The emitted ledger stores
+all per-component costs and their sum without independent decimal rounding.
+Byte costs are added; shared physical memory is not deduplicated, and the common
+token capacity is not multiplied by N.
+
+Use a complete report from **one startup and one accounting domain**, not
+concatenated restarts or repeated tensor-parallel worker reports. The option is
+an assertion of component topology, not automatic discovery. Exact duplicate
+allocation payloads (ignoring the log prefix and whitespace) are refused because
+anonymous rows cannot distinguish equal-sized independent allocations from
+duplicate worker messages. The parser never silently deduplicates them. Missing
+reports, count mismatches, unequal capacities, malformed fields, and ambiguous
+proportional Mamba accounting also refuse with empty stdout. Fixed Mamba state
+remains supported.
+
+**Verified limit:** synthetic tests cover one, two, three, five, and ten cache
+components. No N-component backend is qualified by those tests. A backend must
+report every component unambiguously and keep their capacities tied across
+changes to the launch cap. If it only exposes an aggregate size or a scalar
+`max_total_num_tokens`, that interface alone cannot establish component count or
+the tie invariant. The existing live admission check still verifies that scalar;
+it does not independently inspect every component. Qualify that behavior for the
+specific backend before enrollment, or leave the profile unenrolled. Unequal
+capacities and per-component proportional auxiliary allocations remain outside
+this contract; do not hide them in fixed overhead.
 
 ### Realized pool is much smaller than the target
 

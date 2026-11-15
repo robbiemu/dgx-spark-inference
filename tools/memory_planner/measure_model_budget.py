@@ -33,6 +33,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import math
 import re
 import sys
 from pathlib import Path
@@ -146,6 +147,60 @@ class Measurement:
         self.record("measured_kv_tokens", best_tokens, best_line[:120])
         self.record("kv_bytes_per_token", round(kv_bytes, 1), f"({best_k}+{best_v}) GiB / {best_tokens} tokens")
         return best_tokens, kv_bytes
+
+    def measure_tied_kv_pools(
+        self, lines: list[str], count: int
+    ) -> tuple[int, tuple[float, ...]]:
+        """Measure N distinct allocation reports with a common token capacity.
+
+        Opt-in asserts that these are disjoint components of one runtime, not
+        repeated worker/startup reports. Anonymous duplicate rows are ambiguous
+        and refused, never deduplicated or counted as separate components.
+        """
+        reports = _find_all(r"KV Cache is allocated\.", lines)
+        if len(reports) != count:
+            raise ValueError(f"expected {count} KV component reports, found {len(reports)}")
+        capacity = 0
+        components: list[float] = []
+        seen: set[str] = set()
+        for report in reports:
+            payload = report.split("KV Cache is allocated.", 1)[1].strip()
+            payload = " ".join(payload.split())
+            if payload in seen:
+                raise ValueError("duplicate KV allocation report; component identity is ambiguous")
+            seen.add(payload)
+            token_fields = re.findall(r"(?<!\w)#?tokens\s*[:=]\s*([^,\s]+)", payload)
+            if len(token_fields) != 1 or not re.fullmatch(r"[0-9]+", token_fields[0]):
+                raise ValueError("each tied component must report one positive integer token capacity")
+            tokens = int(token_fields[0])
+            if tokens <= 0 or (capacity and tokens != capacity):
+                raise ValueError("tied components must have equal positive token capacities")
+            capacity = tokens
+            sizes: list[float] = []
+            for key in ("K size", "V size"):
+                fields = re.findall(rf"{key}\s*[:=]\s*([^,\s]+)\s*(GiB|GB)\b", payload)
+                if len(fields) != 1 or len(re.findall(rf"{key}\s*[:=]", payload)) != 1:
+                    raise ValueError(f"each tied component must report {key} in GB or GiB")
+                try:
+                    size = float(fields[0][0])
+                except ValueError:
+                    raise ValueError(f"invalid {key} in tied component report") from None
+                if not math.isfinite(size) or size < 0:
+                    raise ValueError(f"{key} must be finite and nonnegative")
+                sizes.append(size)
+            try:
+                cost = sum(sizes) * GIB / tokens
+            except OverflowError:
+                raise ValueError("tied component report exceeds numeric range") from None
+            if not math.isfinite(cost) or cost <= 0:
+                raise ValueError("each tied component must have a finite positive byte cost")
+            components.append(cost)
+        if not math.isfinite(sum(components)):
+            raise ValueError("total tied KV byte cost must be finite")
+        self.record("measured_kv_tokens", capacity, "common capacity of every tied component")
+        self.record("kv_pool_bytes_per_token", components, "one additive cost per allocation report")
+        self.record("kv_bytes_per_token", sum(components), "sum of component costs; no deduplication")
+        return capacity, tuple(components)
 
     # -- mamba_cache_gib: from "Mamba Cache is allocated" (hybrid models) ---
 
@@ -314,6 +369,7 @@ def emit_profile(
     fixed_mamba_cache: float = 0.0,
     mamba_kv_memory_ratio: float = 0.0,
     fraction_base: str = "a_preload",
+    kv_pool_components: tuple[float, ...] = (),
 ) -> str:
     """Emit a [[profiles]] TOML block ready to append to budget_ledger.toml."""
     lines = [
@@ -330,7 +386,14 @@ def emit_profile(
         lines.append(f"minimum_admissible_pool_tokens = {minimum_pool}   # role contract floor")
     if maximum_pool > 0:
         lines.append(f"maximum_useful_pool_tokens = {maximum_pool}")
-    lines.append(f"kv_bytes_per_token     = {kv_bytes:.1f}")
+    if kv_pool_components:
+        # Round-trip all costs together; independent decimal rounding can make
+        # the component sum inconsistent with the aggregate after TOML parsing.
+        lines.append('kv_pool_layout = "tied"')
+        lines.append(f"kv_pool_bytes_per_token = {list(kv_pool_components)!r}")
+        lines.append(f"kv_bytes_per_token     = {kv_bytes!r}")
+    else:
+        lines.append(f"kv_bytes_per_token     = {kv_bytes:.1f}")
     lines.append(f"static_pad_gib         = {static_pad}")
     if static_overhead > 0:
         lines.append(f"static_overhead_gib    = {static_overhead:.2f}")
@@ -383,6 +446,11 @@ def main() -> int:
     ap.add_argument("--gpu-headroom", type=float, default=1.0,
                     help="gpu_headroom_gib (default: 1.0)")
     ap.add_argument(
+        "--tied-kv-pools", type=int, default=1, metavar="N",
+        help=("explicit number of disjoint KV components sharing one token capacity "
+              "(N >= 2); 1 preserves single-pool behavior"),
+    )
+    ap.add_argument(
         "--mamba-kv-memory-ratio",
         type=float,
         default=None,
@@ -409,6 +477,8 @@ def main() -> int:
                     help="device total in GiB (required when --fraction-base=device_total)")
     args = ap.parse_args()
 
+    if args.tied_kv_pools < 1:
+        ap.error("--tied-kv-pools must be a positive integer")
     # Validate mem_fraction (must be a valid fraction: >0, <=1)
     if not (0 < args.mem_fraction <= 1):
         print(f"REFUSE: --mem-fraction must be in (0, 1], got {args.mem_fraction}", file=sys.stderr)
@@ -458,7 +528,23 @@ def main() -> int:
 
     # Extract all fields
     weights = m.measure_weights(lines)
-    kv_tokens, kv_bytes = m.measure_kv_pool(lines)
+    kv_pool_components: tuple[float, ...] = ()
+    if args.tied_kv_pools > 1:
+        try:
+            kv_tokens, kv_pool_components = m.measure_tied_kv_pools(lines, args.tied_kv_pools)
+        except ValueError as error:
+            print(f"REFUSE: {error}", file=sys.stderr)
+            return 2
+        kv_bytes = sum(kv_pool_components)
+    else:
+        if len(_find_all(r"KV Cache is allocated\.", lines)) > 1:
+            print(
+                "REFUSE: multiple KV pools found; composite accounting requires "
+                "explicit --tied-kv-pools N and equal per-component token capacities.",
+                file=sys.stderr,
+            )
+            return 2
+        kv_tokens, kv_bytes = m.measure_kv_pool(lines)
     mamba_cache = m.measure_mamba_cache(lines)
     detected_mamba_mode, configured_mamba_ratio = m.measure_mamba_allocator(lines)
     graph_peak = m.measure_graph_peak(lines)
@@ -541,6 +627,9 @@ def main() -> int:
             round(mamba_kv_memory_ratio, 6),
             ratio_source,
         )
+    if kv_pool_components and mamba_kv_memory_ratio != 0:
+        print("REFUSE: proportional Mamba accounting with tied KV is not supported.", file=sys.stderr)
+        return 2
     static_overhead = m.compute_static_overhead(
         args.mem_fraction, base_value, base_name,
         weights, kv_tokens, kv_bytes,
@@ -550,22 +639,11 @@ def main() -> int:
     # Hard-stop checks: refuse to emit TOML if the measurement is not ledger-ready.
     # These print to stderr ONLY (no stdout) so a redirect to a TOML file
     # produces an empty file, not a dangerous partial entry.
-    pool_count = len(_find_all(r"KV Cache is allocated\.", lines))
-    if pool_count > 1:
-        print(
-            "REFUSE: multiple KV pools found (" + str(pool_count) + ").\n"
-            "The current ledger schema and resolver do not support composite KV\n"
-            "allocation. Do not enroll this profile in planner mode. Keep it on\n"
-            "the validated legacy path until explicit multi-pool accounting is\n"
-            "implemented.",
-            file=sys.stderr,
-        )
-        return 2
     if weights == 0:
         print(
             "REFUSE: no 'Load weight end.' lines found.\n"
             "Required markers: 'Load weight begin.' (with avail mem), at least\n"
-            "one 'Load weight end.', and exactly one 'KV Cache is allocated.'",
+            "one 'Load weight end.', and the declared KV allocation reports.",
             file=sys.stderr,
         )
         return 2
@@ -621,6 +699,7 @@ def main() -> int:
         fixed_mamba_cache=fixed_mamba_cache,
         mamba_kv_memory_ratio=mamba_kv_memory_ratio,
         fraction_base=args.fraction_base,
+        kv_pool_components=kv_pool_components,
     )
     print(toml)
     return 0
