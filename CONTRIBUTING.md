@@ -34,6 +34,14 @@ that scope honest are welcome.
 
 ## External checks (run before release, not part of run_all.sh)
 
+The root `VERSION` file is the single source of the project version (SemVer,
+without a `v` prefix). The CLI and installed program use this file even when Git
+metadata is absent. Before publishing a release, run the test gate and confirm
+its tag spelling is `v` followed by the exact contents of `VERSION`. Tags record
+published versions; changing `VERSION` does not create or move a tag. Runtime
+image versions and capability approval scopes are separate identities and must
+not be changed as part of a project-version bump.
+
 ShellCheck on every `.sh`; Gitleaks and TruffleHog over the tree. The maintainer
 runs these after tool install. The contextual scanner in `run_all.sh` is the
 in-tree check; the external scanners are the belt-and-suspenders for publication.

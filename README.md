@@ -9,19 +9,23 @@ The intended topology is a fixed local setup: a few named roles, locally managed
 
 <img width="100%" alt="ChatGPT Image 30 de jun  de 2026, 14_12_19" src="https://github.com/user-attachments/assets/4de0716b-1b83-4d32-8f0e-a49b2e91950e" />
 
-## Coordinated next release
+## Project version
 
-The next coordinated release target is **`v0.2.0-alpha`**, a minor increment from
-the existing `v0.1.0-alpha` tag. Merge tied KV-pool accounting first, the optional
-vLLM backend/capacity integration second, and the low-memory watchdog follow-up
-last. The watchdog follow-up carries this single shared release target; the
-features are not separate releases. Keep the alpha designation pending the
-documented backend and host qualification checks.
+[`VERSION`](VERSION) is the authoritative source version: **`0.2.0-alpha`**, a
+minor increment from the published `v0.1.0-alpha` tag. The installer copies it
+with the program files, and `bash src/inferencectl/inference-cli.sh --version`
+reports it from either a checkout or an installed tree without reading operator
+configuration or contacting a service.
 
-Versions in this repository are identified by Git tags; there is no package
-version field or release automation to update. This is an **unreleased target**,
-not a new tag or release. Publishing that version remains a separate release
-action after all three changes and their qualification are complete.
+Merge tied KV-pool accounting first, the optional vLLM backend/capacity
+integration second, and the low-memory watchdog follow-up last. The watchdog
+follow-up makes this single coordinated source-version bump for all three
+features. The alpha designation retains the documented backend and host
+qualification requirements.
+
+The source version and published tags are distinct: this tree reports
+`0.2.0-alpha`; its corresponding release tag would be `v0.2.0-alpha`. Updating
+the source version does not create a tag or publish a release.
 
 ## Tested environment
 

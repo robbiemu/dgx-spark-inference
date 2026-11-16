@@ -7,6 +7,7 @@
 # available.toml is never touched by swaps).
 #
 # Subcommands:
+#   --version                    report the source/installed program version
 #   status                       resident per role + health + served name
 #   candidates [role]            available candidates (from available.toml) + active
 #   use <role> <candidate_id>    swap: validate offered, edit active-models, restart, verify
@@ -25,6 +26,15 @@ while [ $# -gt 0 ]; do
     *) break;;
   esac
 done
+# Version belongs to the program artifact, not operator state or Git metadata.
+# Handle it before sourcing configuration; it requires no running service.
+if [ "${1:-}" = --version ]; then
+  PROGRAM_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+  PROGRAM_VERSION="$(cat "$PROGRAM_ROOT/VERSION")"
+  [ -n "$PROGRAM_VERSION" ] || { echo 'ERROR: empty program VERSION' >&2; exit 1; }
+  printf 'dgx-spark-inference %s\n' "$PROGRAM_VERSION"
+  exit 0
+fi
 # shellcheck disable=SC1090,SC1091
 [ -f "$CONFIG_ROOT/inference.env" ] && . "$CONFIG_ROOT/inference.env"
 

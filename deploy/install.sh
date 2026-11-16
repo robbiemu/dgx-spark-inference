@@ -90,6 +90,7 @@ OPERATOR_STATE=(active-models.toml runtimes.toml)
 # ---- what this install places under INSTALL_ROOT (PROGRAM files) -------------
 install_program_tree() {
   srun install -d -m 0755 "$INSTALL_ROOT"
+  srun install -m 0644 "$SOURCE_DIR/VERSION" "$INSTALL_ROOT/VERSION"
   srun install -d -m 0755 "$INSTALL_ROOT/src/inferencectl" \
                   "$INSTALL_ROOT/tools" "$INSTALL_ROOT/tools/memory_planner" \
                   "$INSTALL_ROOT/runtime/sglang/adapters" \
