@@ -101,6 +101,7 @@ install_program_tree() {
   srun install -m 0755 "$SOURCE_DIR/tools/bind_active_runtime.py"        "$INSTALL_ROOT/tools/bind_active_runtime.py"
   srun install -m 0755 "$SOURCE_DIR/tools/validate_agentic_endpoint.py"  "$INSTALL_ROOT/tools/validate_agentic_endpoint.py"
   srun install -m 0755 "$SOURCE_DIR/tools/wait_for_health.sh"            "$INSTALL_ROOT/tools/wait_for_health.sh"
+  srun install -m 0755 "$SOURCE_DIR/tools/probe_runtime_capacity.py"     "$INSTALL_ROOT/tools/probe_runtime_capacity.py"
   srun install -m 0755 "$SOURCE_DIR/tools/memory_planner/resolve_memory_plan.py" \
                        "$INSTALL_ROOT/tools/memory_planner/resolve_memory_plan.py"
   srun install -m 0644 "$SOURCE_DIR/runtime/sglang/runtime-manifest.toml" "$INSTALL_ROOT/runtime/sglang/runtime-manifest.toml"
@@ -110,6 +111,11 @@ install_program_tree() {
   # adapter lives at adapters/sglang.sh in the source tree (matching the manifest's
   # launch_adapter declaration), so install copies it in-place — no rename.
   srun install -m 0755 "$SOURCE_DIR/runtime/sglang/adapters/sglang.sh" "$INSTALL_ROOT/runtime/sglang/adapters/sglang.sh"
+  # Optional backend code only: no vLLM manifest, model, catalog, or activation.
+  srun install -d -m 0755 "$INSTALL_ROOT/runtime/vllm/adapters"
+  srun install -m 0755 "$SOURCE_DIR/runtime/vllm/adapters/vllm.sh" "$INSTALL_ROOT/runtime/vllm/adapters/vllm.sh"
+  srun install -m 0755 "$SOURCE_DIR/runtime/vllm/adapters/adapter.py" "$INSTALL_ROOT/runtime/vllm/adapters/adapter.py"
+  srun install -m 0755 "$SOURCE_DIR/runtime/vllm/capacity_probe.py" "$INSTALL_ROOT/runtime/vllm/capacity_probe.py"
   # profiles + bundles + their capability records (immutable artifacts). Copy
   # WITHOUT preserving source ownership: these install root-owned (the live
   # service must not depend on user-owned files under a root-owned path).
