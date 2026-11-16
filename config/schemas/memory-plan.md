@@ -48,6 +48,44 @@ runtime-path calibration (not a model-intrinsic property) determining which
 base the resolver derives mem_fraction_static against. Calibrate by comparing
 predicted versus realized pool sizes; see docs/measure-model-budget.md.
 
+### Tied KV components within one model budget
+
+`kv_pool_layout` defaults to `"single"`, preserving existing ledgers. Set it to
+`"tied"` for **two or more disjoint cache components that always have the same
+token capacity**. `kv_pool_bytes_per_token` is then a list of finite positive
+component costs, and `kv_bytes_per_token` must equal their sum (within floating
+point tolerance). The list length is the component count; there is no fixed
+upper bound in the planner. The compatibility spelling `"tied_target_draft"`
+accepts exactly two components; new measurements emit `"tied"`.
+
+Synthetic field example, not a measured model record:
+
+```toml
+kv_pool_layout = "tied"
+kv_pool_bytes_per_token = [1024.0, 2048.0, 512.0]
+kv_bytes_per_token = 3584.0
+```
+
+At capacity `T`, KV memory is `T * sum(component costs)`. This is **additive
+accounting, not deduplication of shared physical memory**. The token cap is `T`,
+not `N*T`; the fraction and admission gates use the aggregate byte cost. A tied
+group belongs to one model budget, independently of the number of serving roles
+in the topology. Reusing that budget for several roles accounts for its memory
+separately in every slot.
+
+A single layout must not declare component costs. Unequal or independently
+changing capacities require a different accounting model. Fixed Mamba state is
+allowed, but nonzero `mamba_kv_memory_ratio` with tied KV is refused: the current
+schema cannot establish which component that proportional allocator uses as its
+base. Do not move that state into fixed overhead to bypass the refusal.
+
+The measurement tool requires explicit `--tied-kv-pools N` and a complete,
+unambiguous allocation report for every component. A scalar runtime capacity
+report alone does not establish N components or prove that all obey the cap.
+See the [measurement limits](../../docs/measure-model-budget.md#multiple-kv-pools-composite-kv-allocation)
+before enrolling a backend/profile. Synthetic regression tests establish the
+accounting contract; they do not qualify any backend for N-component serving.
+
 ### Fixed overhead versus proportional Mamba state
 
 `static_overhead_gib` is only the measured residual that does not vary with the

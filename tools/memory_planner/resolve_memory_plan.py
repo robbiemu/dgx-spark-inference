@@ -48,10 +48,36 @@ class Budget:
     memavailable_floor_gib: float = 8.0
     gpu_headroom_gib: float = 1.0
     fraction_base: str = "a_preload"
+    # Components share one token capacity; their memory costs are additive.
+    kv_pool_layout: str = "single"
+    kv_pool_bytes_per_token: tuple[float, ...] = ()
 
     VALID_FRACTION_BASES = frozenset({"a_preload", "device_total"})
 
     def __post_init__(self) -> None:
+        if self.kv_pool_layout not in {"single", "tied", "tied_target_draft"}:
+            raise ValueError(f"{self.model_id}: unknown kv_pool_layout")
+        parts = self.kv_pool_bytes_per_token
+        if self.kv_pool_layout == "single":
+            if parts:
+                raise ValueError(f"{self.model_id}: single layout cannot declare components")
+        else:
+            if len(parts) < 2 or any(not math.isfinite(x) or x <= 0 for x in parts):
+                raise ValueError(
+                    f"{self.model_id}: tied layout needs at least two finite positive component costs"
+                )
+            if self.kv_pool_layout == "tied_target_draft" and len(parts) != 2:
+                raise ValueError(
+                    f"{self.model_id}: tied_target_draft requires exactly two components; "
+                    "use tied for N components"
+                )
+            total = sum(parts)
+            if not math.isfinite(total) or not math.isclose(
+                total, self.kv_bytes_per_token, rel_tol=1e-9, abs_tol=1e-9
+            ):
+                raise ValueError(f"{self.model_id}: component costs must sum to kv_bytes_per_token")
+            if self.mamba_kv_memory_ratio != 0:
+                raise ValueError(f"{self.model_id}: proportional Mamba accounting with tied KV is not supported")
         if self.fraction_base not in self.VALID_FRACTION_BASES:
             choices = ", ".join(sorted(self.VALID_FRACTION_BASES))
             raise ValueError(
@@ -265,6 +291,12 @@ def load_budgets(ledger_path: str) -> dict[str, Budget]:
         if not values:
             continue
         model_id = record["model_id"]
+        components = values.get("kv_pool_bytes_per_token", [])
+        if not isinstance(components, list) or any(
+            isinstance(value, bool) or not isinstance(value, (int, float))
+            for value in components
+        ):
+            raise ValueError(f"{model_id}: kv_pool_bytes_per_token must be a numeric array")
         budgets[model_id] = Budget(
             model_id=model_id,
             weights_gib=float(values["weights_gib"]),
@@ -276,6 +308,8 @@ def load_budgets(ledger_path: str) -> dict[str, Budget]:
                 values.get("maximum_useful_pool_tokens", 0)
             ),
             kv_bytes_per_token=float(values["kv_bytes_per_token"]),
+            kv_pool_layout=str(values.get("kv_pool_layout", "single")),
+            kv_pool_bytes_per_token=tuple(float(value) for value in components),
             static_pad_gib=float(values.get("static_pad_gib", 0.5)),
             static_overhead_gib=float(values.get("static_overhead_gib", 0.0)),
             fixed_mamba_cache_gib=float(
