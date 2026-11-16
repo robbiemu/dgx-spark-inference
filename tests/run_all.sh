@@ -85,6 +85,8 @@ python3 tests/test_managed_profiles_use_hf_cache.py || fail=1
 
 say "Test 15 — authenticated endpoint validator parses"
 python3 -m py_compile tools/validate_agentic_endpoint.py || fail=1
+python3 tests/test_memory_watchdog.py || fail=1
+python3 tests/test_project_version.py || fail=1
 
 say "Repository-wide contextual secret scan"
 python3 tests/scan_secrets.py "$ROOT" || fail=1

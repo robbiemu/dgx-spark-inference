@@ -1,0 +1,14 @@
+# Optional template; render operator-owned values before installation.
+[Unit]
+Description=Inference host-memory watchdog
+After=__TARGET_SERVICE__
+BindsTo=__TARGET_SERVICE__
+
+[Service]
+Type=simple
+EnvironmentFile=__WATCHDOG_ENV__
+ExecStart=/usr/bin/python3 "__INSTALL_ROOT__/tools/memory_watchdog.py" --service "__TARGET_SERVICE__" --container "${WATCHDOG_CONTAINER}" --memory-profile "${WATCHDOG_MEMORY_PROFILE}" --minimum-available-gib "${WATCHDOG_MIN_AVAILABLE_GIB}"
+Restart=no
+
+[Install]
+WantedBy=__TARGET_SERVICE__
