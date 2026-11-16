@@ -23,7 +23,8 @@ that scope honest are welcome.
 - **Profiles describe, never contain weights.** A profile carries HF repo + pinned
   revision + quantization + launch params. Fetch weights with `hf` (the Hugging
   Face CLI; documented per profile). No weights are redistributed.
-- **One launch path.** `systemd → dispatch.sh → sglang adapter`. Don't add an
+- **One launch path.** `systemd → dispatch.sh → admission.sh → runtime adapter`
+  when memory admission is enrolled. Don't add an
   alternate launcher.
 - **Capability honesty.** A capability record states what a model *provides*.
   `structured_output` means grammar-constrained; there is no

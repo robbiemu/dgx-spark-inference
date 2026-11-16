@@ -486,16 +486,22 @@ log "launching adapter (allocation verification pending)..."
 ADAPTER_PID=$!
 
 # ---- verify allocation committed before releasing the lock -----------------
-# /health=200 is bare liveness (proven insufficient). The realized pool is behind
-# 401-gated /get_server_info. Poll it (carrying the API key) and confirm the
+# /health=200 is bare liveness (proven insufficient). Query the runtime's declared
+# probe, or SGLang's authenticated /get_server_info, and confirm the
 # realized pool is >= the role's minimum AND <= the requested cap. Only then
 # release the lock. systemd's EnvironmentFile gives us SGLANG_API_KEY.
 verify_ready() {  # returns 0 when realized pool is within [min, cap]
-  local i info realized
+  local i info realized probe_mode
+  probe_mode="$(python3 "$PROJECT_ROOT/tools/probe_runtime_capacity.py" select \
+    "$RUNTIME_ROOT" "${CONTAINER_NAME:-}" 2>/dev/null)" || return 1
   for ((i=0; i<ADMISSION_READY_TIMEOUT; i+=5)); do
     # adapter child crashed? then it can never become ready.
     if ! kill -0 "$ADAPTER_PID" 2>/dev/null; then return 1; fi
     if curl -sf -o /dev/null "http://127.0.0.1:${PORT}/health" 2>/dev/null; then
+      if [ "$probe_mode" = custom ]; then
+        realized="$(python3 "$PROJECT_ROOT/tools/probe_runtime_capacity.py" probe \
+          "$RUNTIME_ROOT" "${CONTAINER_NAME:-}" 2>/dev/null || true)"
+      else
       # liveness up — now verify realized capacity via the authenticated endpoint.
       info="$(curl -sf -H "Authorization: Bearer ${SGLANG_API_KEY:-}" \
                   "http://127.0.0.1:${PORT}/get_server_info" 2>/dev/null || true)"
@@ -506,6 +512,7 @@ try:
 except Exception:
     sys.exit(1)
 ' 2>/dev/null || true)"
+      fi
       # Distinguish: (a) realized reported AND in band -> verified; (b) realized
       # reported AND out of band -> unhealthy contract, kill; (c) not yet reported
       # (empty/0/unparseable) -> keep polling. Treating 0 as "reported" would

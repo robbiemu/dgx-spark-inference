@@ -71,6 +71,7 @@ python3 tests/test_wait_for_health.py || fail=1
 python3 tests/test_measure_model_budget.py || fail=1
 python3 tests/test_fraction_base_validation.py || fail=1
 python3 tests/test_adapter_precedence.py || fail=1
+python3 tests/test_vllm_backend.py || fail=1
 
 say "Test 13b — joint floor-first allocation is configuration-derived"
 python3 tests/test_joint_memory_planner.py || fail=1

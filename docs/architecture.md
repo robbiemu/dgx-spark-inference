@@ -29,8 +29,10 @@ happens and where it deliberately does not.
                        docker run … sglang serve --config <rendered yaml>
 ```
 
-There is exactly one launch path: `systemd → dispatch.sh → sglang adapter`. There
-is no alternate launcher. (The lessons from the earlier v1 design — why a
+There is exactly one launch path: `systemd → dispatch.sh → runtime adapter`,
+with `admission.sh` between dispatch and the adapter for enrolled memory plans.
+SGLang remains the default. There is no alternate launcher. (The lessons from
+the earlier v1 design — why a
 dispatcher exists, why the in-container `--host 127.0.0.1` breaks Docker
 `--publish`, why flashinfer is required on GB10 — are in
 `docs/known-limitations.md`, as prose, never as runnable history files.)
@@ -77,6 +79,63 @@ race (two concurrent dispatchers cannot both pass on the same free-memory
 snapshot). Refusals exit 75. See `config/schemas/memory-plan.md`. **Only the
 memory resolver is on the live path** — the capability resolver remains a
 test-time consistency tool, never invoked at launch.
+
+### Optional vLLM backend and realized capacity
+
+`runtime/vllm/adapters/vllm.sh` implements the same seven-argument dispatcher
+contract as SGLang. It preserves per-unit port/container identity when reading
+the operator environment. The installer copies the backend code but does not
+register a vLLM runtime, offer a model, change bindings, or activate a service.
+Model capability qualification and catalog approval remain separate requirements.
+
+An operator-owned runtime manifest must declare `runtime_kind = "vllm"`, a
+`runtime_id`, a pinned `image`/`image_id`,
+`launch_adapter = "adapters/vllm.sh"`, and
+`allocation_probe = "capacity_probe.py"`. The profile must be a
+`model-runtime-config` with matching model/runtime identities and a pinned HF
+repository/revision under `[identity]`. The entire model-cache root is mounted
+read-only, retaining snapshot-to-blob links. No model or image pin is supplied
+by this optional backend: the exact runtime must be qualified independently.
+
+Unlike SGLang's derived fraction, this backend uses a **measured fixed cache
+allocation**. The profile's `[allocation].pool_tokens` must exactly match the
+admission wrapper's `DGX_MAX_TOTAL_TOKENS`; `[allocation].cache_bytes` supplies
+vLLM's `kv-cache-memory-bytes`. Both are positive integers measured together.
+For a fixed qualified pool, set the ledger's expected target and useful ceiling
+to that capacity, with a measured admissible floor. If joint planning produces a
+different cap, launch refuses rather than scaling an unqualified byte budget.
+The SGLang fraction is not translated into `gpu-memory-utilization`. The SGLang
+startup-log measurement tool does not measure vLLM profiles.
+
+Generic vLLM CLI options belong in the profile's `[launch]` table. Identity,
+port, authentication, and memory-allocation fields are managed by the adapter
+and cannot be overridden there. The operator supplies `MODEL_CACHE_ROOT`, `PORT`,
+`CONTAINER_NAME`, and a private `DGX_RUNTIME_CONFIG_DIR` through the existing
+unit/environment mechanism. The adapter renders config with mode 0600, verifies
+the image ID, and passes the existing operator key to Docker by the environment
+variable name `VLLM_API_KEY`; the value never appears in command arguments or
+rendered config. Optional runtime settings in the manifest's `[environment]`
+table are also passed by name; they cannot replace the API key. Keep credentials
+out of that table. Docker administrators can still inspect container environments.
+The existing firewall boundary remains required: vLLM API-key protection does
+not cover every endpoint. See [vLLM security](https://docs.vllm.ai/en/stable/usage/security/).
+
+After health succeeds, admission invokes the manifest's optional
+`allocation_probe` (a Python file inside the installed runtime) instead of the
+SGLang server-info request. Missing/invalid custom probes fail closed; runtimes
+without the field retain SGLang verification. The vLLM probe reads only a bounded
+tail from the current container startup and extracts the last reported
+`GPU KV cache size: ... tokens`. It returns a positive integer, never raw logs.
+Admission still enforces the realized `[minimum, cap]` band and removes only the
+candidate on failure. Truncated/missing reports cause refusal, not a guessed
+capacity or a fallback to context length.
+
+No-GPU tests cover rendering, image identity, fixed-allocation refusal, parser
+behavior, custom-probe bounds, and the real admission verifier. They do not
+qualify a model, allocator, multi-worker aggregation, or GPU runtime. Before
+enrollment, validate actual allocation, authenticated inference, cache behavior,
+and co-resident memory gates on the intended GPU/runtime. See the upstream
+[cache-allocation option](https://docs.vllm.ai/en/stable/configuration/engine_args/#--kv-cache-memory-bytes).
 
 ### Weight resolution + the HF cache mount (design note)
 
