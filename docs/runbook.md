@@ -100,6 +100,49 @@ operator state — `agent.env`, `active-models.toml`, `runtimes.toml` are preser
 (those change only via explicit operator action). Confirm with `status` + a
 health check after restart.
 
+## Optional low-memory watchdog
+
+`tools/memory_watchdog.py` monitors Linux `MemAvailable` for one explicitly
+selected inference service. It supplements pre-launch admission; it does not
+allocate memory, reload models, or replace the planner's admission gates.
+The ordinary installer copies the tool only. No watchdog unit is installed,
+enabled, or started automatically.
+
+Supply `--service`, `--container`, `--memory-profile`, and
+`--minimum-available-gib` from operator policy. The floor is a positive GiB
+value; choose it from workload measurements rather than copying another host's
+threshold. `--poll-interval` and `--command-timeout` are optional positive
+seconds. The watchdog first checks the selected systemd service is active,
+activating, or reloading, then verifies the selected container's
+`io.inferencectl.memory_profile` label matches the expected profile. An absent
+or differently labeled container is not a stop target. The watchdog exits when
+the service becomes inactive.
+
+When a matching target has available memory **below** the configured floor,
+the watchdog requests `systemctl --no-block stop` for that service and exits.
+It does not stop other containers or request a restart. Stopping the unit also
+prevents its restart policy from immediately relaunching the memory consumer.
+The stop request is asynchronous: the watchdog does not claim the service has
+finished shutting down or that memory has already recovered. Invalid memory
+data, command timeouts, and stop failures exit nonzero with sanitized diagnostics.
+
+For systemd supervision, the optional template
+[`inference-memory-watchdog.service.in`](../deploy/systemd/inference-memory-watchdog.service.in)
+binds the watchdog's lifetime to a target service. Render `__TARGET_SERVICE__`,
+`__INSTALL_ROOT__`, and `__WATCHDOG_ENV__` with operator-owned values. Its policy
+environment file supplies `WATCHDOG_CONTAINER`, `WATCHDOG_MEMORY_PROFILE`, and
+`WATCHDOG_MIN_AVAILABLE_GIB`. Keep that file operator-owned and writable only by
+administrators. Review the rendered unit before installing/enabling it as a
+separate operator action; the repository does not select a target or threshold.
+The process needs permission to inspect Docker and stop the selected systemd
+service. The template intentionally uses `Restart=no`.
+
+Tests use synthetic memory and mocked commands; they never stop a live service.
+They verify the threshold boundary, profile guard, startup states, bounded
+commands, and failure behavior. End-to-end systemd/Docker shutdown and memory
+recovery still need a separately authorized controlled host test. A fast memory
+spike can outrun polling or shutdown, so this is not an OOM-prevention guarantee.
+
 ## Thinking-mode timeouts (availability)
 
 Thinking-mode requests can run **200–400s** end-to-end. Any reverse proxy or

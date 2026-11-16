@@ -99,6 +99,8 @@ install_program_tree() {
   srun install -m 0755 "$SOURCE_DIR/src/inferencectl/admission.sh"       "$INSTALL_ROOT/src/inferencectl/admission.sh"
   srun install -m 0755 "$SOURCE_DIR/tools/resolve_service_plan.py"       "$INSTALL_ROOT/tools/resolve_service_plan.py"
   srun install -m 0755 "$SOURCE_DIR/tools/bind_active_runtime.py"        "$INSTALL_ROOT/tools/bind_active_runtime.py"
+  # Optional tool only; never install, enable, or start a watchdog unit here.
+  srun install -m 0755 "$SOURCE_DIR/tools/memory_watchdog.py"            "$INSTALL_ROOT/tools/memory_watchdog.py"
   srun install -m 0755 "$SOURCE_DIR/tools/validate_agentic_endpoint.py"  "$INSTALL_ROOT/tools/validate_agentic_endpoint.py"
   srun install -m 0755 "$SOURCE_DIR/tools/wait_for_health.sh"            "$INSTALL_ROOT/tools/wait_for_health.sh"
   srun install -m 0755 "$SOURCE_DIR/tools/memory_planner/resolve_memory_plan.py" \
